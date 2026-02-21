@@ -1,0 +1,54 @@
+# ============================================================     
+# USER SETTINGS
+# ============================================================
+
+[user]
+name = "USER"
+timezone = "India/Kolkata"
+language = "en"
+
+# Response formatted type (concise, balanced, detailed)
+response_style = "balanced"
+
+
+# Model Agression (aggressive(more local), balanced, quality (more cloud))
+cost_sensitivity = "quality"
+
+# Proactive suggestions based on context 
+proactive_suggestions = true
+
+# ============================================================     
+# MODEL CONFIGURATION
+# ============================================================ 
+
+[models.local]
+# Primary model for reasoning
+primary_model = "qwen-2.5-7b"
+
+# Small model for intent classification (Tier 1)
+intent_model = "qwen-2.5-3b"
+
+# Thread count for CPU inference
+threads = 4
+
+# Context window size
+context_size = 4096
+
+# GPU layers to offload (0 = CPU only, -1 = all)
+gpu_layers = 0
+
+# Where models are downloaded
+models_dir = "~/.flynn/models"
+
+[models.cloud]
+# API provider: openrouter
+provider = "openrouter"
+
+# Default cloud model for Tier 3
+default_model = "deepseek/deepseek-r1"
+
+# When to use cloud: never, smart, always
+mode = "smart"
+
+# Monthly budget limit in USD
+monthly_budget = 10.0

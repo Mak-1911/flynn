@@ -1,0 +1,58 @@
+# Binaries
+flynn
+flynnd
+flynn.exe
+flynnd.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Build output
+build/
+dist/
+*.test
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Flynn runtime data
+.flynn/
+*.db
+*.db-shm
+*.db-wal
+
+# Model weights (large files)
+*.gguf
+*.gguf.part
+*.bin
+
+# Desktop app
+desktop/src-tauri/target/
+desktop/dist/
+desktop/node_modules/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Test coverage
+*.out
+coverage/
+.claude
