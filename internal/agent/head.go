@@ -23,26 +23,26 @@ import (
 
 // HeadAgent is the main orchestrator for Flynn.
 type HeadAgent struct {
-	tenantID       string
-	userID         string
-	classifier      *classifier.Classifier
-	planLib        *planlib.PlanLibrary
-	subagentReg    *subagent.Registry
-	model          model.Model
-	teamDB         *sql.DB
-	personalDB     *sql.DB
+	tenantID    string
+	userID      string
+	classifier  *classifier.Classifier
+	planLib     *planlib.PlanLibrary
+	subagentReg *subagent.Registry
+	model       model.Model
+	teamDB      *sql.DB
+	personalDB  *sql.DB
 }
 
 // Config configures the Head Agent.
 type Config struct {
-	TenantID    string
-	UserID      string
-	Classifier  *classifier.Classifier
-	PlanLib     *planlib.PlanLibrary
-	Subagents   *subagent.Registry
-	Model       model.Model
-	TeamDB      *sql.DB
-	PersonalDB  *sql.DB
+	TenantID   string
+	UserID     string
+	Classifier *classifier.Classifier
+	PlanLib    *planlib.PlanLibrary
+	Subagents  *subagent.Registry
+	Model      model.Model
+	TeamDB     *sql.DB
+	PersonalDB *sql.DB
 }
 
 // NewHeadAgent creates a new Head Agent.
@@ -50,7 +50,7 @@ func NewHeadAgent(cfg *Config) *HeadAgent {
 	return &HeadAgent{
 		tenantID:    cfg.TenantID,
 		userID:      cfg.UserID,
-		classifier:   cfg.Classifier,
+		classifier:  cfg.Classifier,
 		planLib:     cfg.PlanLib,
 		subagentReg: cfg.Subagents,
 		model:       cfg.Model,
@@ -177,11 +177,11 @@ func (h *HeadAgent) generatePlan(ctx context.Context, intent *classifier.Intent,
 // executePlan executes a plan through subagents.
 func (h *HeadAgent) executePlan(ctx context.Context, plan *planlib.Plan) (*planlib.PlanExecution, error) {
 	execution := &planlib.PlanExecution{
-		PlanID:      plan.ID,
-		Variables:   make(map[string]any),
-		Results:     make([]planlib.StepResult, len(plan.Steps)),
-		Status:      "running",
-		StepCount:   len(plan.Steps),
+		PlanID:    plan.ID,
+		Variables: make(map[string]any),
+		Results:   make([]planlib.StepResult, len(plan.Steps)),
+		Status:    "running",
+		StepCount: len(plan.Steps),
 	}
 
 	if h.planLib != nil {
@@ -266,10 +266,10 @@ func (h *HeadAgent) executeStep(ctx context.Context, step planlib.PlanStep) *pla
 	result, err := sub.Execute(ctx, subStep)
 
 	return &planlib.StepResult{
-		StepID:     step.ID,
-		Success:    result != nil && err == nil,
-		Data:       result,
-		Error:      func() string {
+		StepID:  step.ID,
+		Success: result != nil && err == nil,
+		Data:    result,
+		Error: func() string {
 			if err != nil {
 				return err.Error()
 			}
@@ -284,7 +284,7 @@ func (h *HeadAgent) executeStep(ctx context.Context, step planlib.PlanStep) *pla
 			}
 			return 0
 		}(),
-		Cost:       func() float64 {
+		Cost: func() float64 {
 			if result != nil {
 				return result.Cost
 			}
@@ -374,11 +374,11 @@ func (h *HeadAgent) GetStatus(ctx context.Context) (*Status, error) {
 
 // Response is the response from the Head Agent.
 type Response struct {
-	Intent     *classifier.Intent `json:"intent"`
-	Message    string              `json:"message"`
+	Intent     *classifier.Intent     `json:"intent"`
+	Message    string                 `json:"message"`
 	Execution  *planlib.PlanExecution `json:"execution"`
-	DurationMs int64               `json:"duration_ms"`
-	Tier       int                 `json:"tier"`
+	DurationMs int64                  `json:"duration_ms"`
+	Tier       int                    `json:"tier"`
 }
 
 // Status represents the Head Agent's status.
@@ -439,6 +439,7 @@ Available subagents:
 - code: For coding tasks (analyze, run_tests, git_op, explain)
 - file: For file operations (read, write, search, list, delete)
 - research: For web research (web_search, fetch_url, summarize)
+- graph: For knowledge graph (ingest_file, ingest_text, entity_upsert, link, search, relations, stats)
 
 Respond with ONLY the JSON object.`
 

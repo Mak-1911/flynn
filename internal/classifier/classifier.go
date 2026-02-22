@@ -46,14 +46,14 @@ type Response struct {
 
 // Classifier classifies user intents.
 type Classifier struct {
-	patterns  []*IntentPattern
-	model     Model
+	patterns      []*IntentPattern
+	model         Model
 	minConfidence float64
 }
 
 // Config for classifier.
 type Config struct {
-	Model        Model
+	Model         Model
 	MinConfidence float64
 }
 
@@ -63,8 +63,8 @@ func NewClassifier(cfg *Config) *Classifier {
 		cfg = &Config{MinConfidence: 0.7}
 	}
 	return &Classifier{
-		patterns:    defaultPatterns(),
-		model:       cfg.Model,
+		patterns:      defaultPatterns(),
+		model:         cfg.Model,
 		minConfidence: cfg.MinConfidence,
 	}
 }
@@ -150,6 +150,8 @@ func (c *Classifier) ExtractVariables(message string, intent *Intent) map[string
 		vars = extractTaskVariables(message)
 	case "calendar":
 		vars = extractCalendarVariables(message)
+	case "graph":
+		vars = extractGraphVariables(message)
 	}
 
 	return vars
@@ -166,7 +168,7 @@ func (c *Classifier) AddPattern(pattern *IntentPattern) {
 }
 
 const classificationPrompt = `Classify the user's intent. Return ONLY a JSON object with this exact format:
-{"category": "code|file|research|task|calendar|system|chat", "subcategory": "specific_action", "confidence": 0.0-1.0, "tier": 0-3}
+{"category": "code|file|research|task|calendar|graph|system|chat", "subcategory": "specific_action", "confidence": 0.0-1.0, "tier": 0-3}
 
 Categories and examples:
 - code: fix_tests, analyze, refactor, write, explain, run_tests, git_op
@@ -174,6 +176,7 @@ Categories and examples:
 - research: web_search, fetch_url, compare, summarize
 - task: create, list, complete, delete
 - calendar: check, schedule, cancel
+- graph: ingest, search, link, relations, stats
 - system: status, cost, help
 - chat: general, question, creative
 

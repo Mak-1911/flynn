@@ -103,6 +103,20 @@ func extractCalendarVariables(message string) map[string]string {
 	return vars
 }
 
+func extractGraphVariables(message string) map[string]string {
+	vars := make(map[string]string)
+
+	if name := extractQuotedText(message); name != "" {
+		vars["name"] = name
+	}
+
+	if rel := extractRelationType(message); rel != "" {
+		vars["relation_type"] = rel
+	}
+
+	return vars
+}
+
 // ============================================================
 // Helper extraction functions
 // ============================================================
@@ -113,7 +127,7 @@ var (
 	urlRegex      = regexp.MustCompile(`https?://\S+`)
 
 	// Code patterns
-	dirRegex     = regexp.MustCompile(`(?:in|at|from)\s+([\w\-./]+)`)
+	dirRegex      = regexp.MustCompile(`(?:in|at|from)\s+([\w\-./]+)`)
 	functionRegex = regexp.MustCompile(`(?:function|method|class)\s+["']?([\w]+)`)
 
 	// Task patterns
@@ -278,6 +292,24 @@ func extractMeetingTitle(message string) string {
 		return strings.TrimSpace(title)
 	}
 
+	return ""
+}
+
+func extractQuotedText(message string) string {
+	quoted := regexp.MustCompile(`["'](.+?)["']`)
+	if match := quoted.FindStringSubmatch(message); len(match) > 1 {
+		return match[1]
+	}
+	return ""
+}
+
+func extractRelationType(message string) string {
+	lower := strings.ToLower(message)
+	for _, rel := range []string{"owns", "uses", "depends on", "related to", "works with", "member of"} {
+		if strings.Contains(lower, rel) {
+			return rel
+		}
+	}
 	return ""
 }
 

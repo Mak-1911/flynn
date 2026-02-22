@@ -7,6 +7,8 @@ package memory
 
 import (
 	"database/sql"
+	// SQLite driver (required for database/sql registration).
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // Store manages both personal and team databases.
@@ -295,14 +297,8 @@ func (s *Store) initPersonal() error {
 		return err
 	}
 
-	// Initialize schema version
-	var version int
-	err = s.personal.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version)
-	if err != nil {
-		_, err = s.personal.Exec("INSERT INTO schema_migrations (version, description) VALUES (1, 'Initial personal schema')")
-		if err != nil {
-			return err
-		}
+	if err := ensureSchemaVersion(s.personal, 1, "Initial personal schema"); err != nil {
+		return err
 	}
 
 	return nil
@@ -411,6 +407,7 @@ func (s *Store) initTeam() error {
 	CREATE INDEX IF NOT EXISTS idx_team_entities_tenant ON team_entities(tenant_id);
 	CREATE INDEX IF NOT EXISTS idx_team_entities_name ON team_entities(tenant_id, name);
 	CREATE INDEX IF NOT EXISTS idx_team_entities_type ON team_entities(tenant_id, entity_type);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_team_entities_unique ON team_entities(tenant_id, name, entity_type);
 
 	CREATE TABLE IF NOT EXISTS team_relations (
 		id              TEXT PRIMARY KEY,
@@ -593,14 +590,26 @@ func (s *Store) initTeam() error {
 		return err
 	}
 
-	// Initialize schema version
-	var version int
-	err = s.team.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version)
-	if err != nil {
-		_, err = s.team.Exec("INSERT INTO schema_migrations (version, description) VALUES (1, 'Initial team schema')")
-		if err != nil {
-			return err
-		}
+	if err := ensureSchemaVersion(s.team, 1, "Initial team schema"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func ensureSchemaVersion(db *sql.DB, version int, description string) error {
+	var current sql.NullInt64
+	if err := db.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&current); err != nil {
+		return err
+	}
+
+	if !current.Valid || int(current.Int64) < version {
+		_, err := db.Exec(
+			"INSERT INTO schema_migrations (version, description) VALUES (?, ?)",
+			version,
+			description,
+		)
+		return err
 	}
 
 	return nil
