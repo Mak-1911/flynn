@@ -2,12 +2,14 @@
 package model
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -68,6 +70,9 @@ func (c *OpenRouterClient) Generate(ctx context.Context, req *Request) (*Respons
 	if req.JSON {
 		body["response_format"] = map[string]string{"type": "json_object"}
 	}
+	if req.Stream {
+		body["stream"] = true
+	}
 
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
@@ -97,6 +102,15 @@ func (c *OpenRouterClient) Generate(ctx context.Context, req *Request) (*Respons
 			lastErr = fmt.Errorf("request failed: %w", err)
 			continue
 		}
+		if req.Stream {
+			streamResp, err := c.handleStreamResponse(ctx, resp)
+			resp.Body.Close()
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			return streamResp, nil
+		}
 
 		respBody, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -123,13 +137,79 @@ func (c *OpenRouterClient) Generate(ctx context.Context, req *Request) (*Respons
 		}
 
 		return &Response{
-			Text:      orResp.Choices[0].Message.Content,
+			Text:       orResp.Choices[0].Message.Content,
 			TokensUsed: orResp.Usage.TotalTokens,
-			Model:     orResp.Model,
+			Model:      orResp.Model,
 		}, nil
 	}
 
 	return nil, lastErr
+}
+
+func (c *OpenRouterClient) handleStreamResponse(ctx context.Context, resp *http.Response) (*Response, error) {
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	writer, _ := ctx.Value("stream_writer").(io.Writer)
+	streamUsedPtr, _ := ctx.Value("stream_used").(*bool)
+
+	var fullText bytes.Buffer
+	scanner := bufio.NewScanner(resp.Body)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		if !bytes.HasPrefix([]byte(line), []byte("data: ")) {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk openRouterStreamResponse
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		delta := chunk.Choices[0].Delta.Content
+		if delta == "" {
+			continue
+		}
+		fullText.WriteString(delta)
+		if writer != nil {
+			_, _ = writer.Write([]byte(delta))
+			if streamUsedPtr != nil {
+				*streamUsedPtr = true
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	text := fullText.String()
+	return &Response{
+		Text:       text,
+		TokensUsed: approxTokens(text),
+		Model:      c.cfg.Model,
+	}, nil
+}
+
+func approxTokens(text string) int {
+	if text == "" {
+		return 0
+	}
+	return (len(text) / 4) + 1
 }
 
 // IsAvailable checks if the client is configured.
@@ -167,4 +247,12 @@ type openRouterResponse struct {
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
+}
+
+type openRouterStreamResponse struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+	} `json:"choices"`
 }

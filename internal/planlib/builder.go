@@ -222,6 +222,15 @@ func ListTemplates() []string {
 func Instantiate(template *Plan, vars map[string]string) (*Plan, error) {
 	plan := *template
 	plan.ID = "" // Will be set when stored
+	// Fill default variables from template if not provided.
+	for _, v := range plan.Variables {
+		if _, ok := vars[v.Name]; ok {
+			continue
+		}
+		if v.Default != nil {
+			vars[v.Name] = fmt.Sprint(v.Default)
+		}
+	}
 
 	// Fill variables in steps
 	for i := range plan.Steps {

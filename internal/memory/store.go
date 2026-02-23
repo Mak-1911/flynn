@@ -7,6 +7,8 @@ package memory
 
 import (
 	"database/sql"
+	"fmt"
+
 	// SQLite driver (required for database/sql registration).
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -154,6 +156,24 @@ func (s *Store) Team() *sql.DB {
 	return s.team
 }
 
+// EnsureTenant ensures a tenant exists in the team database.
+func (s *Store) EnsureTenant(id, name string) error {
+	if s == nil || s.team == nil {
+		return fmt.Errorf("team database not initialized")
+	}
+	if id == "" {
+		return fmt.Errorf("tenant id is required")
+	}
+	if name == "" {
+		name = "Default Tenant"
+	}
+	_, err := s.team.Exec(`
+		INSERT OR IGNORE INTO tenants (id, name, created_at, updated_at)
+		VALUES (?, ?, strftime('%s','now'), strftime('%s','now'))
+	`, id, name)
+	return err
+}
+
 // ============================================================
 // PERSONAL DB SCHEMA
 // ============================================================
@@ -205,6 +225,37 @@ func (s *Store) initPersonal() error {
 	CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
 	CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_messages_tier ON messages(tier);
+
+	-- ============================================================
+	-- MEMORY: USER PROFILE FACTS
+	-- ============================================================
+
+	CREATE TABLE IF NOT EXISTS memory_profile (
+		id          TEXT PRIMARY KEY,
+		field       TEXT NOT NULL,
+		value       TEXT NOT NULL,
+		confidence  REAL NOT NULL DEFAULT 0.7,
+		updated_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+		UNIQUE(field)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_memory_profile_field ON memory_profile(field);
+
+	-- ============================================================
+	-- MEMORY: PERSONAL ACTIONS
+	-- ============================================================
+
+	CREATE TABLE IF NOT EXISTS memory_actions (
+		id            TEXT PRIMARY KEY,
+		trigger       TEXT NOT NULL,
+		action        TEXT NOT NULL,
+		metadata_json TEXT,
+		confidence    REAL NOT NULL DEFAULT 0.7,
+		updated_at    INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+		UNIQUE(trigger)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_memory_actions_trigger ON memory_actions(trigger);
 
 	-- ============================================================
 	-- USER PROFILE
