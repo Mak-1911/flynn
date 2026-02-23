@@ -8,6 +8,7 @@ DAEMON_NAME=flynnd
 GO=go
 GOFLAGS=-v
 LDFLAGS=-s -w
+GO_TAGS=sqlite_fts5
 
 # Build directories
 BUILD_DIR=build
@@ -25,7 +26,7 @@ help: ## Show this help message
 
 build: ## Build for current platform
 	@echo "Building $(BINARY_NAME)..."
-	@$(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/flynn
+	@$(GO) build $(GOFLAGS) -tags "$(GO_TAGS)" -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/flynn
 	@echo "Done: $(BUILD_DIR)/$(BINARY_NAME)"
 
 build-all: ## Build for all platforms
@@ -34,26 +35,26 @@ build-all: ## Build for all platforms
 	@mkdir -p $(BUILD_DARWIN)/amd64 $(BUILD_DARWIN)/arm64
 	@mkdir -p $(BUILD_WINDOWS)/amd64
 	@echo "Building Linux amd64..."
-	@GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_LINUX)/amd64/$(BINARY_NAME) ./cmd/flynn
+	@GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -tags "$(GO_TAGS)" -ldflags "$(LDFLAGS)" -o $(BUILD_LINUX)/amd64/$(BINARY_NAME) ./cmd/flynn
 	@echo "Building Linux arm64..."
-	@GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_LINUX)/arm64/$(BINARY_NAME) ./cmd/flynn
+	@GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -tags "$(GO_TAGS)" -ldflags "$(LDFLAGS)" -o $(BUILD_LINUX)/arm64/$(BINARY_NAME) ./cmd/flynn
 	@echo "Building Darwin amd64..."
-	@GOOS=darwin GOARCH=amd64 $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_DARWIN)/amd64/$(BINARY_NAME) ./cmd/flynn
+	@GOOS=darwin GOARCH=amd64 $(GO) build $(GOFLAGS) -tags "$(GO_TAGS)" -ldflags "$(LDFLAGS)" -o $(BUILD_DARWIN)/amd64/$(BINARY_NAME) ./cmd/flynn
 	@echo "Building Darwin arm64..."
-	@GOOS=darwin GOARCH=arm64 $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_DARWIN)/arm64/$(BINARY_NAME) ./cmd/flynn
+	@GOOS=darwin GOARCH=arm64 $(GO) build $(GOFLAGS) -tags "$(GO_TAGS)" -ldflags "$(LDFLAGS)" -o $(BUILD_DARWIN)/arm64/$(BINARY_NAME) ./cmd/flynn
 	@echo "Building Windows amd64..."
-	@GOOS=windows GOARCH=amd64 $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_WINDOWS)/amd64/$(BINARY_NAME).exe ./cmd/flynn
+	@GOOS=windows GOARCH=amd64 $(GO) build $(GOFLAGS) -tags "$(GO_TAGS)" -ldflags "$(LDFLAGS)" -o $(BUILD_WINDOWS)/amd64/$(BINARY_NAME).exe ./cmd/flynn
 
 run: ## Run Flynn CLI
-	@$(GO) run ./cmd/flynn
+	@$(GO) run -tags "$(GO_TAGS)" ./cmd/flynn
 
 test: ## Run tests
 	@echo "Running tests..."
-	@$(GO) test -v ./...
+	@$(GO) test -v -tags "$(GO_TAGS)" ./...
 
 test-coverage: ## Run tests with coverage
 	@echo "Running tests with coverage..."
-	@$(GO) test -v -coverprofile=coverage.out ./...
+	@$(GO) test -v -coverprofile=coverage.out -tags "$(GO_TAGS)" ./...
 	@$(GO) tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
 

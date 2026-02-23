@@ -41,6 +41,8 @@ func (g *GraphAgent) Capabilities() []string {
 		"link",          // Link two entities
 		"search",        // Search entities by name
 		"relations",     // Get relations for an entity
+		"related",       // Get related entities
+		"summarize",     // Summarize an entity
 		"stats",         // Graph stats
 	}
 }
@@ -153,6 +155,20 @@ func (g *GraphAgent) Execute(ctx context.Context, step *PlanStep) (*Result, erro
 			entityID = entity.ID
 		}
 		result, err = g.getRelations(ctx, tenantID, entityID)
+	case "related":
+		name, _ := step.Input["name"].(string)
+		entityType, _ := step.Input["type"].(string)
+		if name == "" || entityType == "" {
+			return &Result{Success: false, Error: "name and type required"}, nil
+		}
+		result, err = g.getRelated(ctx, tenantID, name, entityType)
+	case "summarize":
+		name, _ := step.Input["name"].(string)
+		entityType, _ := step.Input["type"].(string)
+		if name == "" || entityType == "" {
+			return &Result{Success: false, Error: "name and type required"}, nil
+		}
+		result, err = g.summarizeEntity(ctx, tenantID, name, entityType)
 	case "stats":
 		result, err = g.store.Stats(ctx, tenantID)
 	default:
@@ -199,7 +215,6 @@ func (g *GraphAgent) ingestFile(ctx context.Context, tenantID, path string) (any
 		return nil, err
 	}
 
-	fileType := strings.TrimPrefix(filepath.Ext(absPath), ".")
 	title := filepath.Base(absPath)
 
 	return g.ingestText(ctx, tenantID, absPath, title, string(content))
@@ -295,6 +310,66 @@ func (g *GraphAgent) searchEntities(ctx context.Context, tenantID, query string)
 
 func (g *GraphAgent) getRelations(ctx context.Context, tenantID, entityID string) (any, error) {
 	return g.store.GetRelations(ctx, tenantID, entityID, 50)
+}
+
+func (g *GraphAgent) getRelated(ctx context.Context, tenantID, name, entityType string) (any, error) {
+	entity, err := g.store.FindEntityByName(ctx, tenantID, name, entityType)
+	if err != nil {
+		return nil, err
+	}
+	if entity == nil {
+		return map[string]any{"name": name, "type": entityType, "related": []any{}}, nil
+	}
+
+	relations, err := g.store.GetRelations(ctx, tenantID, entity.ID, 50)
+	if err != nil {
+		return nil, err
+	}
+
+	related := []map[string]any{}
+	for _, r := range relations {
+		otherID := r.TargetID
+		if r.TargetID == entity.ID {
+			otherID = r.SourceID
+		}
+		other, _ := g.store.GetEntityByID(ctx, tenantID, otherID)
+		if other == nil {
+			continue
+		}
+		related = append(related, map[string]any{
+			"name":     other.Name,
+			"type":     other.EntityType,
+			"relation": r.RelationType,
+		})
+	}
+
+	return map[string]any{
+		"name":    entity.Name,
+		"type":    entity.EntityType,
+		"related": related,
+	}, nil
+}
+
+func (g *GraphAgent) summarizeEntity(ctx context.Context, tenantID, name, entityType string) (any, error) {
+	entity, err := g.store.FindEntityByName(ctx, tenantID, name, entityType)
+	if err != nil {
+		return nil, err
+	}
+	if entity == nil {
+		return map[string]any{"name": name, "type": entityType, "summary": "entity not found"}, nil
+	}
+
+	relations, err := g.store.GetRelations(ctx, tenantID, entity.ID, 100)
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]any{
+		"name":        entity.Name,
+		"type":        entity.EntityType,
+		"description": entity.Description,
+		"relations":   len(relations),
+	}, nil
 }
 
 // ============================================================

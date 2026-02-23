@@ -10,6 +10,7 @@ type Config struct {
 	Features Features       `toml:"features"`
 	Paths    PathsConfig    `toml:"paths"`
 	Privacy  PrivacyConfig  `toml:"privacy"`
+	Graph    GraphConfig    `toml:"graph"`
 }
 
 // InstanceConfig contains instance-level settings.
@@ -20,9 +21,9 @@ type InstanceConfig struct {
 
 // TenantConfig contains team/tenant settings.
 type TenantConfig struct {
-	ID      string          `toml:"id"`
-	Name    string          `toml:"name"`
-	Members []TeamMember    `toml:"members"`
+	ID      string       `toml:"id"`
+	Name    string       `toml:"name"`
+	Members []TeamMember `toml:"members"`
 }
 
 // TeamMember represents a team member.
@@ -34,12 +35,12 @@ type TeamMember struct {
 
 // UserConfig contains user preferences.
 type UserConfig struct {
-	Name                 string  `toml:"name"`
-	Timezone             string  `toml:"timezone"`
-	Language             string  `toml:"language"`
-	ResponseStyle        string  `toml:"response_style"`        // concise, balanced, detailed
-	CostSensitivity      string  `toml:"cost_sensitivity"`      // aggressive, balanced, quality
-	ProactiveSuggestions bool    `toml:"proactive_suggestions"`
+	Name                 string `toml:"name"`
+	Timezone             string `toml:"timezone"`
+	Language             string `toml:"language"`
+	ResponseStyle        string `toml:"response_style"`   // concise, balanced, detailed
+	CostSensitivity      string `toml:"cost_sensitivity"` // aggressive, balanced, quality
+	ProactiveSuggestions bool   `toml:"proactive_suggestions"`
 }
 
 // ModelConfig contains model-related settings.
@@ -62,10 +63,10 @@ type LocalModelConfig struct {
 type CloudModelConfig struct {
 	Provider      string  `toml:"provider"`
 	DefaultModel  string  `toml:"default_model"`
-	Mode          string  `toml:"mode"`          // never, smart, always
+	Mode          string  `toml:"mode"` // never, smart, always
 	MonthlyBudget float64 `toml:"monthly_budget"`
-	APIKey        string  `toml:"api_key"`       // API key for cloud provider
-	Enabled       bool    `toml:"enabled"`       // Whether cloud is enabled
+	APIKey        string  `toml:"api_key"` // API key for cloud provider
+	Enabled       bool    `toml:"enabled"` // Whether cloud is enabled
 }
 
 // Features contains feature flags.
@@ -88,9 +89,18 @@ type PathsConfig struct {
 
 // PrivacyConfig contains privacy settings.
 type PrivacyConfig struct {
-	AllowCloudFor  []string `toml:"allow_cloud_for"`
+	AllowCloudFor   []string `toml:"allow_cloud_for"`
 	SensitiveTopics []string `toml:"sensitive_topics"`
-	Anonymize      bool     `toml:"anonymize"`
+	Anonymize       bool     `toml:"anonymize"`
+}
+
+// GraphConfig contains knowledge graph settings.
+type GraphConfig struct {
+	Enabled       bool `toml:"enabled"`
+	UseLLM        bool `toml:"use_llm"`
+	MaxEntities   int  `toml:"max_entities"`
+	MaxRelations  int  `toml:"max_relations"`
+	MaxChunkBytes int  `toml:"max_chunk_bytes"`
 }
 
 // ThreadMode represents the visibility of a conversation.

@@ -13,9 +13,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/flynn-ai/flynn/internal/classifier"
+	"github.com/flynn-ai/flynn/internal/graph"
 	"github.com/flynn-ai/flynn/internal/model"
 	"github.com/flynn-ai/flynn/internal/planlib"
 	"github.com/flynn-ai/flynn/internal/subagent"
@@ -23,39 +25,45 @@ import (
 
 // HeadAgent is the main orchestrator for Flynn.
 type HeadAgent struct {
-	tenantID    string
-	userID      string
-	classifier  *classifier.Classifier
-	planLib     *planlib.PlanLibrary
-	subagentReg *subagent.Registry
-	model       model.Model
-	teamDB      *sql.DB
-	personalDB  *sql.DB
+	tenantID      string
+	userID        string
+	classifier    *classifier.Classifier
+	planLib       *planlib.PlanLibrary
+	subagentReg   *subagent.Registry
+	model         model.Model
+	graphIngestor *graph.Ingestor
+	graphContext  *graph.ContextBuilder
+	teamDB        *sql.DB
+	personalDB    *sql.DB
 }
 
 // Config configures the Head Agent.
 type Config struct {
-	TenantID   string
-	UserID     string
-	Classifier *classifier.Classifier
-	PlanLib    *planlib.PlanLibrary
-	Subagents  *subagent.Registry
-	Model      model.Model
-	TeamDB     *sql.DB
-	PersonalDB *sql.DB
+	TenantID      string
+	UserID        string
+	Classifier    *classifier.Classifier
+	PlanLib       *planlib.PlanLibrary
+	Subagents     *subagent.Registry
+	Model         model.Model
+	GraphIngestor *graph.Ingestor
+	GraphContext  *graph.ContextBuilder
+	TeamDB        *sql.DB
+	PersonalDB    *sql.DB
 }
 
 // NewHeadAgent creates a new Head Agent.
 func NewHeadAgent(cfg *Config) *HeadAgent {
 	return &HeadAgent{
-		tenantID:    cfg.TenantID,
-		userID:      cfg.UserID,
-		classifier:  cfg.Classifier,
-		planLib:     cfg.PlanLib,
-		subagentReg: cfg.Subagents,
-		model:       cfg.Model,
-		teamDB:      cfg.TeamDB,
-		personalDB:  cfg.PersonalDB,
+		tenantID:      cfg.TenantID,
+		userID:        cfg.UserID,
+		classifier:    cfg.Classifier,
+		planLib:       cfg.PlanLib,
+		subagentReg:   cfg.Subagents,
+		model:         cfg.Model,
+		graphIngestor: cfg.GraphIngestor,
+		graphContext:  cfg.GraphContext,
+		teamDB:        cfg.TeamDB,
+		personalDB:    cfg.PersonalDB,
 	}
 }
 
@@ -100,6 +108,10 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 		// Log error but don't fail
 		fmt.Printf("Warning: failed to store conversation: %v\n", err)
 	}
+	if h.graphIngestor != nil {
+		h.ingestConversation(ctx, message, "user", threadMode)
+		h.ingestConversation(ctx, h.formatResponse(execution), "assistant", threadMode)
+	}
 
 	// Step 7: Build response
 	resp := &Response{
@@ -114,6 +126,20 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 	// TODO: Track pattern IDs to properly record success/failure rates
 
 	return resp, nil
+}
+
+func (h *HeadAgent) ingestConversation(ctx context.Context, content string, role string, mode ThreadMode) {
+	if strings.TrimSpace(content) == "" {
+		return
+	}
+
+	source := graph.Source{
+		Type: "message",
+		Ref:  fmt.Sprintf("%s-%d", role, time.Now().UnixNano()),
+	}
+	title := fmt.Sprintf("%s message", role)
+
+	_, _ = h.graphIngestor.IngestText(ctx, h.tenantID, source, title, content)
 }
 
 // getOrCreatePlan looks up an existing plan or generates a new one.
@@ -135,13 +161,14 @@ func (h *HeadAgent) getOrCreatePlan(ctx context.Context, intent *classifier.Inte
 	}
 
 	// No plan found, generate one via AI
-	return h.generatePlan(ctx, intent, message)
+	graphContext := h.buildGraphContext(ctx, message)
+	return h.generatePlan(ctx, intent, message, graphContext)
 }
 
 // generatePlan generates a new plan using the AI model.
-func (h *HeadAgent) generatePlan(ctx context.Context, intent *classifier.Intent, message string) (*planlib.Plan, error) {
+func (h *HeadAgent) generatePlan(ctx context.Context, intent *classifier.Intent, message string, graphContext string) (*planlib.Plan, error) {
 	// Build prompt for plan generation
-	prompt := fmt.Sprintf(planGenerationPrompt, intent.String(), message)
+	prompt := fmt.Sprintf(planGenerationPrompt, intent.String(), graphContext, message)
 
 	resp, err := h.model.Generate(ctx, &model.Request{
 		Prompt: prompt,
@@ -172,6 +199,17 @@ func (h *HeadAgent) generatePlan(ctx context.Context, intent *classifier.Intent,
 	}
 
 	return &plan, nil
+}
+
+func (h *HeadAgent) buildGraphContext(ctx context.Context, message string) string {
+	if h.graphContext == nil {
+		return ""
+	}
+	contextText, err := h.graphContext.FromText(ctx, h.tenantID, message)
+	if err != nil {
+		return ""
+	}
+	return contextText
 }
 
 // executePlan executes a plan through subagents.
@@ -408,6 +446,8 @@ const planGenerationPrompt = `You are a plan generator for an AI assistant.
 Generate a JSON execution plan for the following request:
 
 Intent: %s
+Knowledge Graph Context:
+%s
 User Message: %s
 
 Return ONLY a JSON object with this format:
@@ -439,7 +479,7 @@ Available subagents:
 - code: For coding tasks (analyze, run_tests, git_op, explain)
 - file: For file operations (read, write, search, list, delete)
 - research: For web research (web_search, fetch_url, summarize)
-- graph: For knowledge graph (ingest_file, ingest_text, entity_upsert, link, search, relations, stats)
+- graph: For knowledge graph (ingest_file, ingest_text, entity_upsert, link, search, relations, related, summarize, stats)
 
 Respond with ONLY the JSON object.`
 

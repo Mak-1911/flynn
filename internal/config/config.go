@@ -68,6 +68,13 @@ func Default() *Config {
 			SensitiveTopics: []string{"health", "finance", "passwords"},
 			Anonymize:       true,
 		},
+		Graph: GraphConfig{
+			Enabled:       true,
+			UseLLM:        false,
+			MaxEntities:   20,
+			MaxRelations:  20,
+			MaxChunkBytes: 2000,
+		},
 	}
 }
 

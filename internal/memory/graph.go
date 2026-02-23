@@ -167,6 +167,27 @@ func (g *GraphStore) FindEntityByName(ctx context.Context, tenantID, name, entit
 	return &e, nil
 }
 
+// GetEntityByID returns a single entity by ID.
+func (g *GraphStore) GetEntityByID(ctx context.Context, tenantID, id string) (*Entity, error) {
+	var e Entity
+	err := g.db.QueryRowContext(ctx, `
+		SELECT id, tenant_id, name, entity_type, description, metadata_json, embedding_id, importance, created_at, updated_at
+		FROM team_entities
+		WHERE tenant_id = ? AND id = ?
+		LIMIT 1
+	`, tenantID, id).Scan(
+		&e.ID, &e.TenantID, &e.Name, &e.EntityType, &e.Description, &e.MetadataJSON,
+		&e.EmbeddingID, &e.Importance, &e.CreatedAt, &e.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
 // SearchEntities performs a simple LIKE search on entity names.
 func (g *GraphStore) SearchEntities(ctx context.Context, tenantID, query string, limit int) ([]*Entity, error) {
 	if limit <= 0 {
@@ -356,6 +377,76 @@ func (g *GraphStore) Stats(ctx context.Context, tenantID string) (*GraphStats, e
 	}
 
 	return stats, nil
+}
+
+// ListEntities returns recent entities for a tenant.
+func (g *GraphStore) ListEntities(ctx context.Context, tenantID string, limit int) ([]*Entity, error) {
+	if g == nil || g.db == nil {
+		return nil, fmt.Errorf("graph store not initialized")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := g.db.QueryContext(ctx, `
+		SELECT id, tenant_id, name, entity_type, description, metadata_json, embedding_id, importance, created_at, updated_at
+		FROM team_entities
+		WHERE tenant_id = ?
+		ORDER BY updated_at DESC
+		LIMIT ?
+	`, tenantID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*Entity
+	for rows.Next() {
+		var e Entity
+		if err := rows.Scan(
+			&e.ID, &e.TenantID, &e.Name, &e.EntityType, &e.Description, &e.MetadataJSON,
+			&e.EmbeddingID, &e.Importance, &e.CreatedAt, &e.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, &e)
+	}
+	return out, rows.Err()
+}
+
+// ListRelations returns recent relations for a tenant.
+func (g *GraphStore) ListRelations(ctx context.Context, tenantID string, limit int) ([]*Relation, error) {
+	if g == nil || g.db == nil {
+		return nil, fmt.Errorf("graph store not initialized")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := g.db.QueryContext(ctx, `
+		SELECT id, tenant_id, source_id, target_id, relation_type, metadata_json, confidence, created_at, updated_at
+		FROM team_relations
+		WHERE tenant_id = ?
+		ORDER BY updated_at DESC
+		LIMIT ?
+	`, tenantID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*Relation
+	for rows.Next() {
+		var r Relation
+		if err := rows.Scan(
+			&r.ID, &r.TenantID, &r.SourceID, &r.TargetID, &r.RelationType, &r.MetadataJSON,
+			&r.Confidence, &r.CreatedAt, &r.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, &r)
+	}
+	return out, rows.Err()
 }
 
 func (g *GraphStore) getDocumentID(ctx context.Context, tenantID, path string) (string, error) {
