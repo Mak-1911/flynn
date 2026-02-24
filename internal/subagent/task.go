@@ -15,7 +15,7 @@ import (
 type TaskAgent struct {
 	mu    sync.RWMutex
 	tasks map[string]*Task
-	file string // Optional file for persistence
+	file  string // Optional file for persistence
 }
 
 // Task represents a todo item.
@@ -23,7 +23,7 @@ type Task struct {
 	ID          string   `json:"id"`
 	Title       string   `json:"title"`
 	Description string   `json:"description,omitempty"`
-	Status      string   `json:"status"` // pending, in_progress, completed, cancelled
+	Status      string   `json:"status"`   // pending, in_progress, completed, cancelled
 	Priority    int      `json:"priority"` // 1=low, 2=medium, 3=high
 	Tags        []string `json:"tags,omitempty"`
 	CreatedAt   int64    `json:"created_at"`

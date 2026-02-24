@@ -3,7 +3,7 @@ package tool
 
 // Parameter describes a tool parameter.
 type Parameter struct {
-	Type        string   `json:"type"`        // string, number, boolean, array, object
+	Type        string   `json:"type"` // string, number, boolean, array, object
 	Description string   `json:"description"`
 	Required    bool     `json:"required"`
 	Default     any      `json:"default,omitempty"`
@@ -20,23 +20,23 @@ type ToolDefinition struct {
 
 // ToolResult represents the result of a tool execution.
 type ToolResult struct {
-	Success    bool `json:"success"`
-	Data       any  `json:"data,omitempty"`
+	Success    bool   `json:"success"`
+	Data       any    `json:"data,omitempty"`
 	Error      string `json:"error,omitempty"`
-	DurationMs int64 `json:"duration_ms"`
+	DurationMs int64  `json:"duration_ms"`
 }
 
 // FileOperation represents a filesystem operation.
 type FileOperation struct {
-	Op      string `json:"op"`      // read, write, delete, list, search
+	Op      string `json:"op"` // read, write, delete, list, search
 	Path    string `json:"path"`
 	Content string `json:"content,omitempty"` // For write
-	Pattern string `json:"pattern,omitempty"`  // For search
+	Pattern string `json:"pattern,omitempty"` // For search
 }
 
 // GitOperation represents a git operation.
 type GitOperation struct {
-	Op       string   `json:"op"`       // status, commit, push, pull, diff, log
+	Op       string   `json:"op"` // status, commit, push, pull, diff, log
 	RepoPath string   `json:"repo_path"`
 	Message  string   `json:"message,omitempty"` // For commit
 	Files    []string `json:"files,omitempty"`

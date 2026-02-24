@@ -18,29 +18,29 @@ type StreamCallback func(chunk StreamChunk)
 
 // StreamChunk represents a piece of streamed content.
 type StreamChunk struct {
-	Text      string // Text content
-	Done      bool   // Is this the final chunk?
-	ToolCall  bool   // Is this chunk a tool call?
-	ToolName  string // Tool name if ToolCall is true
-	ToolArgs  string // Tool arguments if ToolCall is true
+	Text     string // Text content
+	Done     bool   // Is this the final chunk?
+	ToolCall bool   // Is this chunk a tool call?
+	ToolName string // Tool name if ToolCall is true
+	ToolArgs string // Tool arguments if ToolCall is true
 }
 
 // StreamingProcessor handles streaming with tool call detection.
 type StreamingProcessor struct {
-	agent         *HeadAgent
-	systemPrompt  string
-	userPrompt    string
-	originalMsg   string
-	ctx           context.Context
-	threadMode    ThreadMode
+	agent        *HeadAgent
+	systemPrompt string
+	userPrompt   string
+	originalMsg  string
+	ctx          context.Context
+	threadMode   ThreadMode
 
 	// Accumulated content
 	accumulated strings.Builder
 
 	// Tool call detection
-	inToolCall   bool
-	toolBuffer    strings.Builder
-	toolDepth     int // Track nested brackets
+	inToolCall bool
+	toolBuffer strings.Builder
+	toolDepth  int // Track nested brackets
 
 	// Tool execution state
 	toolsExecuted bool

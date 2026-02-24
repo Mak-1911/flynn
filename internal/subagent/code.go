@@ -29,7 +29,7 @@ type Request struct {
 
 // Response from code analysis.
 type Response struct {
-	Text      string
+	Text       string
 	TokensUsed int
 }
 
@@ -51,14 +51,14 @@ func (c *CodeAgent) Description() string {
 // Capabilities returns the list of supported actions.
 func (c *CodeAgent) Capabilities() []string {
 	return []string{
-		"analyze",      // Analyze codebase structure
-		"run_tests",    // Run test suite
-		"git_status",   // Check git status
-		"git_op",       // Perform git operation
-		"explain",      // Explain code
-		"refactor",     // Refactor code
-		"lint",         // Run linter
-		"format",       // Format code
+		"analyze",    // Analyze codebase structure
+		"run_tests",  // Run test suite
+		"git_status", // Check git status
+		"git_op",     // Perform git operation
+		"explain",    // Explain code
+		"refactor",   // Refactor code
+		"lint",       // Run linter
+		"format",     // Format code
 	}
 }
 
@@ -276,12 +276,12 @@ func (c *CodeAgent) gitStatus(ctx context.Context, path string) (any, int, error
 	}
 
 	status := map[string]any{
-		"branch":     c.getCurrentBranch(ctx, path),
-		"clean":      len(lines) == 0,
-		"changes":    len(lines),
-		"modified":   []string{},
-		"added":      []string{},
-		"untracked":  []string{},
+		"branch":    c.getCurrentBranch(ctx, path),
+		"clean":     len(lines) == 0,
+		"changes":   len(lines),
+		"modified":  []string{},
+		"added":     []string{},
+		"untracked": []string{},
 	}
 
 	for _, line := range lines {
@@ -348,7 +348,7 @@ func (c *CodeAgent) gitOperation(ctx context.Context, path, op string) (any, int
 func (c *CodeAgent) explainCode(ctx context.Context, target string) (any, int, error) {
 	if c.model == nil {
 		return map[string]string{
-			"note": "AI model not available, providing basic explanation",
+			"note":   "AI model not available, providing basic explanation",
 			"target": target,
 		}, 0, nil
 	}
@@ -390,8 +390,8 @@ func (c *CodeAgent) refactorCode(ctx context.Context, target string) (any, int, 
 	}
 
 	return map[string]any{
-		"target":       target,
-		"suggestions":  resp.Text,
+		"target":      target,
+		"suggestions": resp.Text,
 	}, resp.TokensUsed, nil
 }
 
@@ -511,30 +511,30 @@ func fileExists(dir, name string) bool {
 func detectLanguage(path string) string {
 	ext := strings.TrimPrefix(filepath.Ext(path), ".")
 	langs := map[string]string{
-		"go":   "Go",
-		"ts":   "TypeScript",
-		"tsx":  "TypeScript",
-		"js":   "JavaScript",
-		"jsx":  "JavaScript",
-		"py":   "Python",
-		"rs":   "Rust",
-		"c":    "C",
-		"h":    "C",
-		"cpp":  "C++",
-		"cc":   "C++",
-		"hpp":  "C++",
-		"java": "Java",
-		"rb":   "Ruby",
-		"php":  "PHP",
-		"cs":   "C#",
-		"kt":   "Kotlin",
+		"go":    "Go",
+		"ts":    "TypeScript",
+		"tsx":   "TypeScript",
+		"js":    "JavaScript",
+		"jsx":   "JavaScript",
+		"py":    "Python",
+		"rs":    "Rust",
+		"c":     "C",
+		"h":     "C",
+		"cpp":   "C++",
+		"cc":    "C++",
+		"hpp":   "C++",
+		"java":  "Java",
+		"rb":    "Ruby",
+		"php":   "PHP",
+		"cs":    "C#",
+		"kt":    "Kotlin",
 		"swift": "Swift",
-		"sh":   "Shell",
-		"yaml": "YAML",
-		"yml":  "YAML",
-		"json": "JSON",
-		"toml": "TOML",
-		"md":   "Markdown",
+		"sh":    "Shell",
+		"yaml":  "YAML",
+		"yml":   "YAML",
+		"json":  "JSON",
+		"toml":  "TOML",
+		"md":    "Markdown",
 	}
 
 	if lang, ok := langs[ext]; ok {

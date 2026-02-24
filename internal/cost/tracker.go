@@ -5,7 +5,7 @@ import "time"
 
 // Tracker monitors AI usage and calculates costs.
 type Tracker struct {
-	localFree  bool // Local models are free
+	localFree  bool               // Local models are free
 	hourlyRate map[string]float64 // Cost per 1M tokens by model
 	daily      *DailyStats
 	monthly    *MonthlyStats

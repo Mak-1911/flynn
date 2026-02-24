@@ -1,5 +1,51 @@
 # Flynn - Immediate Roadmap
 
+> **Core Philosophy: Maximum Function + Minimum Compute**
+>
+> Flynn is designed to run on resource-constrained devices (1GB Raspberry Pi, small cloud VMs).
+> Any feature addition MUST respect the Resource Budget below.
+
+## Resource Budget (Locked)
+
+**Target Platform:** 1GB Raspberry Pi / Small Cloud VM
+
+| Resource | Budget | Current | Status |
+|----------|--------|---------|--------|
+| Binary Size | <30MB | 24MB | ✅ Within budget |
+| RAM (no model) | <100MB | ~50MB | ✅ Within budget |
+| Storage (~/.flynn/) | <50MB | ~10MB | ✅ Within budget |
+| Boot Time | <2s | <1s | ✅ Within budget |
+| Dependencies | Zero runtime | Static binary | ✅ Within budget |
+
+## Feature Approval Checklist
+
+Before adding ANY feature, it must pass ALL checks:
+
+```
+☐ Works on 1GB RAM (no model)
+☐ Requires no new external dependencies
+☐ Binary size increase <5MB
+☐ RAM increase <20MB baseline
+☐ Can be disabled/optional if heavy
+☐ Aligns with local-first philosophy
+```
+
+**Heavy Features (DO NOT ADD without redesign):**
+- ❌ Web UI (use CLI instead)
+- ❌ Electron/Tauri desktop apps
+- ❌ Vector database services (use SQLite FTS5)
+- ❌ Neo4j/graph databases (use SQLite relations)
+- ❌ Complex orchestration frameworks
+- ❌ Heavy ML models locally
+
+**Light Alternatives (PREFERRED):**
+- ✅ CLI with Bubble Tea (lightweight TUI)
+- ✅ SQLite for all storage (built-in)
+- ✅ FTS5 for search (built-in)
+- ✅ Rule-based logic (no ML classifiers)
+- ✅ Direct execution patterns (skip LLM)
+- ✅ Cloud model only (no local inference)
+
 ## Current Status
 ✅ Basic single-agent architecture
 ✅ Tool calling with bracket format `[tool.action param="value"]`
@@ -18,11 +64,11 @@
    - Handle tool calls during streaming
    - Clean up debug output
 
-2. **Better Error Handling**
-   - Retry logic for failed API calls
-   - Graceful degradation when models unavailable
-   - User-friendly error messages
-   - Tool execution error recovery
+2. **Better Error Handling** ✅
+   - ~~Retry logic for failed API calls~~
+   - ~~Graceful degradation when models unavailable~~
+   - ~~User-friendly error messages~~
+   - Tool execution error recovery (partial)
 
 3. **Tool Calling Enhancements**
    - Support OpenAI function calling format
@@ -109,9 +155,10 @@
 | Agent Core | ✅ | Basic structure works |
 | Tool Calling | 🟡 | Bracket format, need OpenAI/Anthropic |
 | Streaming | 🟡 | Partial, needs completion |
-| Memory | 🟡 | Storage works, retrieval needs work |
-| Knowledge Graph | 🟡 | Basic structure |
-| CLI | 🟡 | Functional, needs polish |
+| Memory | ✅ | Storage, retrieval, extraction working |
+| Knowledge Graph | ✅ | Entities, relations, context working |
+| Error Handling | ✅ | Retry logic, graceful degradation, user-friendly messages |
+| CLI | ✅ | Enhanced with markdown, code blocks, status bar |
 | API Server | ❌ | Not started |
 | Web UI | ❌ | Not started |
 | Multi-Agent | ❌ | Not started |

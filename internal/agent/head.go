@@ -11,6 +11,7 @@ package agent
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	apperrors "github.com/flynn-ai/flynn/internal/errors"
 	"github.com/flynn-ai/flynn/internal/graph"
 	"github.com/flynn-ai/flynn/internal/memory"
 	"github.com/flynn-ai/flynn/internal/model"
@@ -44,8 +46,8 @@ type HeadAgent struct {
 	personalDB      *sql.DB
 
 	// Streaming support
-	streamWriter    io.Writer
-	streamMux       sync.Mutex
+	streamWriter io.Writer
+	streamMux    sync.Mutex
 }
 
 // Config configures the Head Agent.
@@ -112,7 +114,7 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 		return resp, nil
 	}
 
-	// Step 2: Build context for the LLM
+	// Step 2: Build context for the LLM (with graceful degradation)
 	systemPrompt := h.buildSystemPrompt()
 	userPrompt := h.buildUserPrompt(message, ctx)
 
@@ -125,19 +127,24 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("model generation failed: %w", err)
+		// Handle errors with graceful degradation
+		return h.handleModelError(ctx, err, message, startTime, threadMode)
 	}
 
 	// Check for empty/incomplete response
 	if resp.Text == "" {
-		return nil, fmt.Errorf("model returned empty response")
+		return nil, apperrors.NewBuilder(apperrors.CodeModelInvalidResponse, "model returned empty response").
+			Temporary().
+			WithSuggestion("Try rephrasing your request").
+			WithSuggestion("Check if the model is available").
+			Build()
 	}
 
 	// Step 4: Check for tool calls in response and execute them
 	toolCalls := parseToolCalls(resp.Text)
 	if len(toolCalls) > 0 {
-		// Execute tool calls in parallel
-		toolResults := h.executeToolCallsParallel(ctx, toolCalls)
+		// Execute tool calls in parallel and get tool info
+		toolResults, toolInfos := h.executeToolCallsParallelWithInfo(ctx, toolCalls)
 
 		// Feed results back to LLM for final response
 		followUpPrompt := fmt.Sprintf("%s\n\nOriginal user request: %s\n\nTool execution results:\n%s\n\nPlease provide a helpful response based on these results.",
@@ -150,21 +157,34 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 			Stream: false,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("final generation failed: %w", err)
+			// If final generation fails, return the tool results directly
+			return &Response{
+				Message: fmt.Sprintf("I executed the tools but couldn't generate a final response. Here are the raw results:\n\n%s", toolResults),
+				DurationMs:    time.Since(startTime).Milliseconds(),
+				Tier:          int(resp.Tier),
+				TokensUsed:    resp.TokensUsed,
+				ToolsExecuted: toolInfos,
+			}, nil
 		}
 
 		response := &Response{
-			Message:    finalResp.Text,
-			DurationMs: time.Since(startTime).Milliseconds(),
-			Tier:       int(resp.Tier),
-			TokensUsed: resp.TokensUsed + finalResp.TokensUsed,
+			Message:       finalResp.Text,
+			DurationMs:    time.Since(startTime).Milliseconds(),
+			Tier:          int(resp.Tier),
+			TokensUsed:    resp.TokensUsed + finalResp.TokensUsed,
+			ToolsExecuted: toolInfos,
 		}
 		h.recordConversation(ctx, message, finalResp.Text, threadMode)
 		return response, nil
 	}
 
-	// Step 5: Extract memory facts from conversation
-	h.ingestMemory(ctx, message, resp.Text)
+	// Step 5: Extract memory facts from conversation (non-blocking)
+	// We don't want memory errors to affect the response
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		h.ingestMemory(ctx, message, resp.Text)
+	}()
 
 	response := &Response{
 		Message:    resp.Text,
@@ -175,6 +195,66 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 
 	h.recordConversation(ctx, message, resp.Text, threadMode)
 	return response, nil
+}
+
+// handleModelError handles model errors with graceful degradation.
+func (h *HeadAgent) handleModelError(ctx context.Context, err error, message string, startTime time.Time, threadMode ThreadMode) (*Response, error) {
+	// Check if it's a known error type
+	var appErr *apperrors.AppError
+	if errors.As(err, &appErr) {
+		switch appErr.Category {
+		case apperrors.CategoryRateLimit:
+			// Rate limit - provide helpful message
+			return nil, apperrors.NewBuilder(apperrors.CodeModelRateLimit, "The model is currently rate-limited").
+				Temporary().
+				WithSuggestion("Wait a moment before trying again").
+				WithSuggestion("Check your API quota").
+				Build()
+		case apperrors.CategoryUser:
+			// User error (e.g., invalid API key)
+			return nil, appErr
+		case apperrors.CategorySystem:
+			// System error - try to provide a fallback response
+			return h.getFallbackResponse(ctx, message, appErr, startTime, threadMode)
+		default:
+			// Temporary error - retry might work
+			return nil, appErr
+		}
+	}
+
+	// Unknown error type - wrap it
+	return nil, apperrors.Wrap(err, apperrors.CodeModelUnavailable, "model generation failed", apperrors.CategoryTemporary)
+}
+
+// getFallbackResponse provides a fallback response when the model is unavailable.
+func (h *HeadAgent) getFallbackResponse(ctx context.Context, message string, modelErr error, startTime time.Time, threadMode ThreadMode) (*Response, error) {
+	// Check if we can provide any useful information
+	// Try direct execution patterns
+	if exec := h.tryDirectExecution(ctx, message); exec != nil {
+		return &Response{
+			Message:    exec.Message,
+			Execution:  exec.Execution,
+			DurationMs: time.Since(startTime).Milliseconds(),
+			ToolUsed:   exec.Tool,
+		}, nil
+	}
+
+	// Check if it's a simple question we can answer
+	if isSimpleQuestion(message) {
+		return &Response{
+			Message:    "I'm having trouble connecting to my model right now. Please try again in a moment.",
+			DurationMs: time.Since(startTime).Milliseconds(),
+		}, nil
+	}
+
+	// Return a helpful error message
+	return nil, apperrors.NewBuilder(apperrors.CodeModelUnavailable, "The AI model is currently unavailable").
+		Temporary().
+		Wrap(modelErr).
+		WithSuggestion("Check your internet connection").
+		WithSuggestion("Verify your API key is configured").
+		WithSuggestion("Try again in a few moments").
+		Build()
 }
 
 // DirectExecution represents a pre-executed tool result.
@@ -230,18 +310,18 @@ func (h *HeadAgent) tryDirectExecution(ctx context.Context, message string) *Dir
 // ============================================================
 
 type FileOp struct {
-	Action string
-	Path   string
+	Action  string
+	Path    string
 	Pattern string
 	Content string
-	Dest   string
+	Dest    string
 }
 
 func matchFileOperation(msg string) *FileOp {
 	// read file patterns
 	readPatterns := []struct {
 		pattern *regexp.Regexp
-		action string
+		action  string
 	}{
 		{regexp.MustCompile(`^(?:read|show|cat|display|open)\s+(.+?)(?:\s+file)?$`), "read"},
 		{regexp.MustCompile(`^what(?:'s| is)\s+in\s+(.+)$`), "read"},
@@ -255,7 +335,7 @@ func matchFileOperation(msg string) *FileOp {
 	// list directory patterns
 	listPatterns := []struct {
 		pattern *regexp.Regexp
-		action string
+		action  string
 	}{
 		{regexp.MustCompile(`^(?:list|ls|dir)\s*(.*)$`), "list"},
 		{regexp.MustCompile(`^(?:show|what(?:'s| is))\s+(?:files?|in)\s+(.+)$`), "list"},
@@ -273,7 +353,7 @@ func matchFileOperation(msg string) *FileOp {
 	// search patterns
 	searchPatterns := []struct {
 		pattern *regexp.Regexp
-		action string
+		action  string
 	}{
 		{regexp.MustCompile(`^(?:search|grep|find)\s+(.+?)\s+in\s+(.+)$`), "search"},
 		{regexp.MustCompile(`^(?:search|grep|find)\s+(.+?)\s+(?:for|in)\s+(.+)$`), "search"},
@@ -393,10 +473,10 @@ func (h *HeadAgent) executeFileOperation(ctx context.Context, op *FileOp) *Direc
 	return &DirectExecution{
 		Message: formatToolResult(result),
 		Execution: &ToolExecution{
-			Tool:    "file",
-			Action:  op.Action,
-			Input:   input,
-			Output:  result.Data,
+			Tool:       "file",
+			Action:     op.Action,
+			Input:      input,
+			Output:     result.Data,
 			DurationMs: result.DurationMs,
 		},
 		Tool: "file",
@@ -943,21 +1023,30 @@ func (h *HeadAgent) ForgetMemory(ctx context.Context, memType, key string) error
 
 // Response is the response from the Head Agent.
 type Response struct {
-	Message    string          `json:"message"`
-	Execution  *ToolExecution  `json:"execution,omitempty"`
-	DurationMs int64           `json:"duration_ms"`
-	Tier       int             `json:"tier"`
-	TokensUsed int             `json:"tokens_used"`
-	ToolUsed   string          `json:"tool_used,omitempty"`
+	Message       string         `json:"message"`
+	Execution     *ToolExecution `json:"execution,omitempty"`
+	DurationMs    int64          `json:"duration_ms"`
+	Tier          int            `json:"tier"`
+	TokensUsed    int            `json:"tokens_used"`
+	ToolUsed      string         `json:"tool_used,omitempty"`
+	ToolsExecuted []ToolCallInfo `json:"tools_executed,omitempty"`
+}
+
+// ToolCallInfo represents info about an executed tool.
+type ToolCallInfo struct {
+	Tool    string `json:"tool"`
+	Action  string `json:"action"`
+	Success bool   `json:"success"`
+	Output  string `json:"output,omitempty"`
 }
 
 // ToolExecution represents a tool execution result.
 type ToolExecution struct {
-	Tool        string    `json:"tool"`
-	Action      string    `json:"action"`
-	Input       map[string]any `json:"input"`
-	Output      any       `json:"output"`
-	DurationMs  int64     `json:"duration_ms"`
+	Tool       string         `json:"tool"`
+	Action     string         `json:"action"`
+	Input      map[string]any `json:"input"`
+	Output     any            `json:"output"`
+	DurationMs int64          `json:"duration_ms"`
 }
 
 // Status represents the Head Agent's status.
@@ -1088,6 +1177,12 @@ func isAcknowledgement(msg string) bool {
 	return false
 }
 
+func isSimpleQuestion(msg string) bool {
+	// Check if it's a simple greeting or acknowledgement
+	lower := strings.ToLower(strings.TrimSpace(msg))
+	return isGreeting(lower) || isAcknowledgement(lower)
+}
+
 var greetings = []string{
 	"Hey! How can I help?",
 	"Hello! What's on your mind?",
@@ -1204,6 +1299,12 @@ func (h *HeadAgent) executeToolCall(ctx context.Context, tc *ToolCall) (*subagen
 
 // executeToolCallsParallel executes multiple tool calls in parallel and aggregates results.
 func (h *HeadAgent) executeToolCallsParallel(ctx context.Context, toolCalls []ToolCall) string {
+	result, _ := h.executeToolCallsParallelWithInfo(ctx, toolCalls)
+	return result
+}
+
+// executeToolCallsParallelWithInfo executes tools and returns both formatted string and tool info.
+func (h *HeadAgent) executeToolCallsParallelWithInfo(ctx context.Context, toolCalls []ToolCall) (string, []ToolCallInfo) {
 	type toolResult struct {
 		index  int
 		call   *ToolCall
@@ -1236,11 +1337,33 @@ func (h *HeadAgent) executeToolCallsParallel(ctx context.Context, toolCalls []To
 		results[r.index] = r
 	}
 
+	// Build tool info slice
+	toolInfos := make([]ToolCallInfo, len(toolCalls))
+
 	// Format results for LLM
 	var output strings.Builder
 	output.WriteString(fmt.Sprintf("Executed %d tools in parallel:\n\n", len(toolCalls)))
 
 	for i, r := range results {
+		// Build tool info
+		info := ToolCallInfo{
+			Tool:   r.call.Tool,
+			Action: r.call.Action,
+		}
+		if r.err != nil {
+			info.Success = false
+			info.Output = fmt.Sprintf("Error: %v", r.err)
+		} else if r.result != nil {
+			info.Success = r.result.Success
+			if !r.result.Success {
+				info.Output = r.result.Error
+			} else {
+				info.Output = formatToolResult(r.result)
+			}
+		}
+		toolInfos[i] = info
+
+		// Format for LLM
 		output.WriteString(fmt.Sprintf("### Tool %d: %s.%s\n", i+1, r.call.Tool, r.call.Action))
 		if r.err != nil {
 			output.WriteString(fmt.Sprintf("**Error**: %v\n\n", r.err))
@@ -1254,5 +1377,5 @@ func (h *HeadAgent) executeToolCallsParallel(ctx context.Context, toolCalls []To
 		}
 	}
 
-	return output.String()
+	return output.String(), toolInfos
 }

@@ -237,7 +237,7 @@ func (p *PlanLibrary) CreateExecution(ctx context.Context, tenantID string, exec
 func (p *PlanLibrary) UpdateExecution(ctx context.Context, tenantID string, exec *PlanExecution) error {
 	exec.CompletedAt = time.Now().Unix()
 	if exec.DurationMs == 0 {
-		exec.DurationMs = exec.CompletedAt - exec.StartedAt * 1000
+		exec.DurationMs = exec.CompletedAt - exec.StartedAt*1000
 	}
 
 	stepsJSON, err := json.Marshal(exec.Results)
@@ -408,23 +408,23 @@ func (p *PlanLibrary) GetExecutionHistory(ctx context.Context, tenantID, planID 
 
 // Plan represents an execution plan.
 type Plan struct {
-	ID          string      `json:"id"`
-	Intent      string      `json:"intent"`      // e.g., "code.fix_tests"
-	Description string      `json:"description"`
-	Steps       []PlanStep  `json:"steps"`
-	Variables   []Variable  `json:"variables"`
-	CreatedAt   int64       `json:"created_at"`
-	UpdatedAt   int64       `json:"updated_at"`
+	ID          string     `json:"id"`
+	Intent      string     `json:"intent"` // e.g., "code.fix_tests"
+	Description string     `json:"description"`
+	Steps       []PlanStep `json:"steps"`
+	Variables   []Variable `json:"variables"`
+	CreatedAt   int64      `json:"created_at"`
+	UpdatedAt   int64      `json:"updated_at"`
 }
 
 // PlanStep represents a single step in an execution plan.
 type PlanStep struct {
-	ID       int         `json:"id"`
-	Subagent string      `json:"subagent"`
-	Action   string      `json:"action"`
+	ID       int            `json:"id"`
+	Subagent string         `json:"subagent"`
+	Action   string         `json:"action"`
 	Input    map[string]any `json:"input"`
-	Depends  []int       `json:"depends"`
-	Timeout  int         `json:"timeout"`
+	Depends  []int          `json:"depends"`
+	Timeout  int            `json:"timeout"`
 }
 
 // Variable represents a template variable.
@@ -438,21 +438,21 @@ type Variable struct {
 
 // PlanExecution represents an execution of a plan.
 type PlanExecution struct {
-	ID            string       `json:"id"`
-	TenantID      string       `json:"tenant_id"`
-	PlanID        string       `json:"plan_id"`
-	PatternID     string       `json:"pattern_id,omitempty"`
-	Variables     map[string]any `json:"variables"`
-	Results       []StepResult `json:"results"`
-	Status        string       `json:"status"`
-	Error         string       `json:"error,omitempty"`
-	StartedAt     int64        `json:"started_at"`
-	CompletedAt   int64        `json:"completed_at,omitempty"`
-	DurationMs    int64        `json:"duration_ms"`
-	TotalTokens   int          `json:"total_tokens"`
-	TotalCost     float64      `json:"total_cost"`
-	StepCount     int          `json:"step_count"`
-	StepsCompleted int         `json:"steps_completed"`
+	ID             string         `json:"id"`
+	TenantID       string         `json:"tenant_id"`
+	PlanID         string         `json:"plan_id"`
+	PatternID      string         `json:"pattern_id,omitempty"`
+	Variables      map[string]any `json:"variables"`
+	Results        []StepResult   `json:"results"`
+	Status         string         `json:"status"`
+	Error          string         `json:"error,omitempty"`
+	StartedAt      int64          `json:"started_at"`
+	CompletedAt    int64          `json:"completed_at,omitempty"`
+	DurationMs     int64          `json:"duration_ms"`
+	TotalTokens    int            `json:"total_tokens"`
+	TotalCost      float64        `json:"total_cost"`
+	StepCount      int            `json:"step_count"`
+	StepsCompleted int            `json:"steps_completed"`
 }
 
 // StepResult represents the result of a step.
@@ -468,19 +468,19 @@ type StepResult struct {
 
 // PlanPattern represents a stored pattern with stats.
 type PlanPattern struct {
-	ID            string    `json:"id"`
-	TenantID      string    `json:"tenant_id"`
-	IntentCategory string   `json:"intent_category"`
-	PlanID        string    `json:"plan_id"`
-	UsageCount    int       `json:"usage_count"`
-	SuccessCount  int       `json:"success_count"`
-	FailureCount  int       `json:"failure_count"`
-	SuccessRate   float64   `json:"success_rate"`
-	LastUsed      int64     `json:"last_used,omitempty"`
-	LastSucceeded int64     `json:"last_succeeded,omitempty"`
-	LastFailed    int64     `json:"last_failed,omitempty"`
-	CreatedAt     int64     `json:"created_at"`
-	UpdatedAt     int64     `json:"updated_at"`
+	ID             string  `json:"id"`
+	TenantID       string  `json:"tenant_id"`
+	IntentCategory string  `json:"intent_category"`
+	PlanID         string  `json:"plan_id"`
+	UsageCount     int     `json:"usage_count"`
+	SuccessCount   int     `json:"success_count"`
+	FailureCount   int     `json:"failure_count"`
+	SuccessRate    float64 `json:"success_rate"`
+	LastUsed       int64   `json:"last_used,omitempty"`
+	LastSucceeded  int64   `json:"last_succeeded,omitempty"`
+	LastFailed     int64   `json:"last_failed,omitempty"`
+	CreatedAt      int64   `json:"created_at"`
+	UpdatedAt      int64   `json:"updated_at"`
 }
 
 // ============================================================

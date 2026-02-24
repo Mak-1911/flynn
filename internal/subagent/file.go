@@ -31,16 +31,16 @@ func (f *FileAgent) Description() string {
 // Capabilities returns the list of supported actions.
 func (f *FileAgent) Capabilities() []string {
 	return []string{
-		"read",      // Read file contents
-		"write",     // Write file contents
-		"search",    // Search for content in files
-		"list",      // List directory contents
-		"delete",    // Delete file or directory
-		"move",      // Move/rename file
-		"copy",      // Copy file
-		"mkdir",     // Create directory
-		"exists",    // Check if path exists
-		"info",      // Get file info
+		"read",   // Read file contents
+		"write",  // Write file contents
+		"search", // Search for content in files
+		"list",   // List directory contents
+		"delete", // Delete file or directory
+		"move",   // Move/rename file
+		"copy",   // Copy file
+		"mkdir",  // Create directory
+		"exists", // Check if path exists
+		"info",   // Get file info
 	}
 }
 
@@ -186,8 +186,8 @@ func (f *FileAgent) writeFile(path, content string) (any, error) {
 	}
 
 	return map[string]any{
-		"path":  absPath,
-		"size":  len(content),
+		"path":   absPath,
+		"size":   len(content),
 		"status": "written",
 	}, nil
 }
@@ -419,7 +419,7 @@ func (f *FileAgent) exists(path string) map[string]any {
 
 	_, err = os.Stat(absPath)
 	return map[string]any{
-		"path":  absPath,
+		"path":   absPath,
 		"exists": err == nil,
 	}
 }

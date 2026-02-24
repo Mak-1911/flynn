@@ -13,8 +13,8 @@ import (
 
 // ResearchAgent handles web research operations.
 type ResearchAgent struct {
-	model    Model
-	client   *http.Client
+	model  Model
+	client *http.Client
 }
 
 // NewResearchAgent creates a new research subagent.
@@ -38,10 +38,10 @@ func (r *ResearchAgent) Description() string {
 // Capabilities returns the list of supported actions.
 func (r *ResearchAgent) Capabilities() []string {
 	return []string{
-		"web_search",  // Search the web
-		"fetch_url",   // Fetch and parse a URL
-		"summarize",   // Summarize content
-		"compare",     // Compare multiple sources
+		"web_search", // Search the web
+		"fetch_url",  // Fetch and parse a URL
+		"summarize",  // Summarize content
+		"compare",    // Compare multiple sources
 	}
 }
 
@@ -200,11 +200,11 @@ func (r *ResearchAgent) fetchURL(ctx context.Context, targetURL string) (any, in
 	}
 
 	return map[string]any{
-		"url":         targetURL,
-		"status":      resp.StatusCode,
+		"url":          targetURL,
+		"status":       resp.StatusCode,
 		"content_type": contentType,
-		"size":        len(body),
-		"content":     content,
+		"size":         len(body),
+		"content":      content,
 	}, 0, nil
 }
 
