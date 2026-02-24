@@ -177,7 +177,7 @@ Categories and examples:
 - task: create, list, complete, delete
 - calendar: check, schedule, cancel
 - graph: ingest, search, link, relations, stats
-- system: status, cost, help
+- system: status, cost, help, open_app, close_app, list_processes, system_info, clipboard_read, clipboard_write, notify, open_url, net_ping, net_download, schedule_run
 - chat: general, question, creative
 
 User message: %s

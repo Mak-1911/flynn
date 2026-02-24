@@ -1,27 +1,29 @@
 // Package agent provides the Head Agent - Flynn's main orchestrator.
 //
-// The Head Agent:
-// - Receives user messages
-// - Classifies intent
-// - Looks up or creates plans
-// - Executes plans via subagents
-// - Aggregates and returns results
+// This is a simplified single-agent architecture:
+// - No intent classification
+// - No plan library
+// - Direct subagent execution via pattern matching
+// - Strong system prompt with capabilities
+// - Streaming responses
 package agent
 
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/flynn-ai/flynn/internal/classifier"
 	"github.com/flynn-ai/flynn/internal/graph"
 	"github.com/flynn-ai/flynn/internal/memory"
 	"github.com/flynn-ai/flynn/internal/model"
-	"github.com/flynn-ai/flynn/internal/planlib"
+	"github.com/flynn-ai/flynn/internal/prompt"
 	"github.com/flynn-ai/flynn/internal/subagent"
 )
 
@@ -29,8 +31,6 @@ import (
 type HeadAgent struct {
 	tenantID        string
 	userID          string
-	classifier      *classifier.Classifier
-	planLib         *planlib.PlanLibrary
 	subagentReg     *subagent.Registry
 	model           model.Model
 	graphIngestor   *graph.Ingestor
@@ -38,16 +38,20 @@ type HeadAgent struct {
 	memoryStore     *memory.MemoryStore
 	memoryRouter    *memory.MemoryRouter
 	memoryExtractor *memory.LLMExtractor
+	memoryRetrieval *memory.EnhancedMemoryStore // Enhanced retrieval
+	promptBuilder   *prompt.Builder
 	teamDB          *sql.DB
 	personalDB      *sql.DB
+
+	// Streaming support
+	streamWriter    io.Writer
+	streamMux       sync.Mutex
 }
 
 // Config configures the Head Agent.
 type Config struct {
 	TenantID        string
 	UserID          string
-	Classifier      *classifier.Classifier
-	PlanLib         *planlib.PlanLibrary
 	Subagents       *subagent.Registry
 	Model           model.Model
 	GraphIngestor   *graph.Ingestor
@@ -55,17 +59,16 @@ type Config struct {
 	MemoryStore     *memory.MemoryStore
 	MemoryRouter    *memory.MemoryRouter
 	MemoryExtractor *memory.LLMExtractor
+	PromptBuilder   *prompt.Builder
 	TeamDB          *sql.DB
 	PersonalDB      *sql.DB
 }
 
 // NewHeadAgent creates a new Head Agent.
 func NewHeadAgent(cfg *Config) *HeadAgent {
-	return &HeadAgent{
+	agent := &HeadAgent{
 		tenantID:        cfg.TenantID,
 		userID:          cfg.UserID,
-		classifier:      cfg.Classifier,
-		planLib:         cfg.PlanLib,
 		subagentReg:     cfg.Subagents,
 		model:           cfg.Model,
 		graphIngestor:   cfg.GraphIngestor,
@@ -73,187 +76,714 @@ func NewHeadAgent(cfg *Config) *HeadAgent {
 		memoryStore:     cfg.MemoryStore,
 		memoryRouter:    cfg.MemoryRouter,
 		memoryExtractor: cfg.MemoryExtractor,
+		promptBuilder:   cfg.PromptBuilder,
 		teamDB:          cfg.TeamDB,
 		personalDB:      cfg.PersonalDB,
 	}
+
+	// Initialize enhanced memory retrieval
+	if cfg.MemoryStore != nil && cfg.PersonalDB != nil {
+		agent.memoryRetrieval = memory.NewEnhancedMemoryStore(cfg.MemoryStore, cfg.PersonalDB)
+	}
+
+	return agent
+}
+
+// SetStreamWriter sets the writer for streaming responses.
+func (h *HeadAgent) SetStreamWriter(w io.Writer) {
+	h.streamMux.Lock()
+	defer h.streamMux.Unlock()
+	h.streamWriter = w
 }
 
 // Process handles a user request and returns a response.
 func (h *HeadAgent) Process(ctx context.Context, message string, threadMode ThreadMode) (*Response, error) {
 	startTime := time.Now()
 
-	// Step 1: Classify intent
-	intent, err := h.classifier.Classify(ctx, message)
-	if err != nil {
-		return nil, fmt.Errorf("classification failed: %w", err)
-	}
-
-	route := routeRequest(message, intent)
-	if route == routeLocal {
-		reply := localReply(message)
+	// Step 1: Check for direct subagent execution patterns
+	if exec := h.tryDirectExecution(ctx, message); exec != nil {
 		resp := &Response{
-			Intent:     intent,
-			Message:    reply,
-			Execution:  nil,
+			Message:    exec.Message,
+			Execution:  exec.Execution,
 			DurationMs: time.Since(startTime).Milliseconds(),
-			Tier:       intent.Tier,
+			ToolUsed:   exec.Tool,
 		}
-		h.recordConversation(ctx, message, reply, threadMode)
+		h.recordConversation(ctx, message, resp.Message, threadMode)
 		return resp, nil
 	}
 
-	if route == routeDirect {
-		reply, facts, derr := h.directReplyWithMemory(ctx, message)
-		if derr != nil {
-			return nil, derr
-		}
-		resp := &Response{
-			Intent:     intent,
-			Message:    reply,
-			Execution:  nil,
-			DurationMs: time.Since(startTime).Milliseconds(),
-			Tier:       intent.Tier,
-		}
-		h.recordConversation(ctx, message, reply, threadMode)
-		if h.memoryStore != nil && len(facts) > 0 {
-			h.ingestMemoryFacts(ctx, facts)
-		}
-		return resp, nil
-	}
+	// Step 2: Build context for the LLM
+	systemPrompt := h.buildSystemPrompt()
+	userPrompt := h.buildUserPrompt(message, ctx)
 
-	// Step 2: Execute a single subagent action (no planning).
-	vars := h.extractVariables(message, intent)
-	if intent.Variables != nil {
-		for k, v := range intent.Variables {
-			vars[k] = v
-		}
-	}
+	// Step 3: Call the model (explicitly non-streaming)
+	resp, err := h.model.Generate(ctx, &model.Request{
+		System: systemPrompt,
+		Prompt: userPrompt,
+		JSON:   false,
+		Stream: false,
+	})
 
-	subResp, err := h.executeIntent(ctx, intent, vars, message)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("model generation failed: %w", err)
 	}
 
-	resp := &Response{
-		Intent:     intent,
-		Message:    subResp,
-		Execution:  nil,
+	// Check for empty/incomplete response
+	if resp.Text == "" {
+		return nil, fmt.Errorf("model returned empty response")
+	}
+
+	// Step 4: Check for tool calls in response and execute them
+	toolCalls := parseToolCalls(resp.Text)
+	if len(toolCalls) > 0 {
+		// Execute tool calls in parallel
+		toolResults := h.executeToolCallsParallel(ctx, toolCalls)
+
+		// Feed results back to LLM for final response
+		followUpPrompt := fmt.Sprintf("%s\n\nOriginal user request: %s\n\nTool execution results:\n%s\n\nPlease provide a helpful response based on these results.",
+			userPrompt, message, toolResults)
+
+		finalResp, err := h.model.Generate(ctx, &model.Request{
+			System: systemPrompt,
+			Prompt: followUpPrompt,
+			JSON:   false,
+			Stream: false,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("final generation failed: %w", err)
+		}
+
+		response := &Response{
+			Message:    finalResp.Text,
+			DurationMs: time.Since(startTime).Milliseconds(),
+			Tier:       int(resp.Tier),
+			TokensUsed: resp.TokensUsed + finalResp.TokensUsed,
+		}
+		h.recordConversation(ctx, message, finalResp.Text, threadMode)
+		return response, nil
+	}
+
+	// Step 5: Extract memory facts from conversation
+	h.ingestMemory(ctx, message, resp.Text)
+
+	response := &Response{
+		Message:    resp.Text,
 		DurationMs: time.Since(startTime).Milliseconds(),
-		Tier:       intent.Tier,
+		Tier:       int(resp.Tier),
+		TokensUsed: resp.TokensUsed,
 	}
-	h.recordConversation(ctx, message, subResp, threadMode)
-	return resp, nil
+
+	h.recordConversation(ctx, message, resp.Text, threadMode)
+	return response, nil
 }
 
-func (h *HeadAgent) ingestConversation(ctx context.Context, content string, role string, mode ThreadMode) {
-	if strings.TrimSpace(content) == "" {
-		return
-	}
-
-	source := graph.Source{
-		Type: "message",
-		Ref:  fmt.Sprintf("%s-%d", role, time.Now().UnixNano()),
-	}
-	title := fmt.Sprintf("%s message", role)
-
-	_, _ = h.graphIngestor.IngestText(ctx, h.tenantID, source, title, content)
+// DirectExecution represents a pre-executed tool result.
+type DirectExecution struct {
+	Message   string
+	Execution *ToolExecution
+	Tool      string
 }
 
-func (h *HeadAgent) recordConversation(ctx context.Context, userMsg, assistantMsg string, mode ThreadMode) {
-	if err := h.storeConversation(ctx, userMsg, nil, mode); err != nil {
-		fmt.Printf("Warning: failed to store conversation: %v\n", err)
-	}
-	if h.graphIngestor != nil {
-		h.ingestConversation(ctx, userMsg, "user", mode)
-		h.ingestConversation(ctx, assistantMsg, "assistant", mode)
-	}
-	if h.memoryStore != nil && h.memoryRouter != nil {
-		h.ingestMemory(ctx, userMsg)
-	}
-}
+// tryDirectExecution checks if the message matches a direct execution pattern.
+func (h *HeadAgent) tryDirectExecution(ctx context.Context, message string) *DirectExecution {
+	msg := strings.ToLower(strings.TrimSpace(message))
 
-func (h *HeadAgent) executeIntent(ctx context.Context, intent *classifier.Intent, vars map[string]string, message string) (string, error) {
-	if intent == nil {
-		return h.directReply(ctx, message)
+	// Check for greeting/acknowledgement - local response
+	if isGreeting(msg) {
+		return &DirectExecution{
+			Message: randomGreeting(),
+			Tool:    "local",
+		}
 	}
-
-	sub, ok := h.subagentReg.Get(intent.Category)
-	if !ok || !sub.ValidateAction(intent.Subcategory) {
-		return h.directReply(ctx, message)
-	}
-
-	if !hasRequiredInputs(intent.Category, intent.Subcategory, vars) {
-		return h.directReply(ctx, message)
-	}
-
-	input := make(map[string]any)
-	for k, v := range vars {
-		input[k] = v
-	}
-	if intent.Category == "task" {
-		if title, ok := vars["task"]; ok && title != "" {
-			if _, hasTitle := input["title"]; !hasTitle {
-				input["title"] = title
-			}
+	if isAcknowledgement(msg) {
+		return &DirectExecution{
+			Message: "Got it.",
+			Tool:    "local",
 		}
 	}
 
+	// File operations patterns
+	if m := matchFileOperation(msg); m != nil {
+		return h.executeFileOperation(ctx, m)
+	}
+
+	// System operations patterns
+	if m := matchSystemOperation(msg); m != nil {
+		return h.executeSystemOperation(ctx, m)
+	}
+
+	// Task operations patterns
+	if m := matchTaskOperation(msg); m != nil {
+		return h.executeTaskOperation(ctx, m)
+	}
+
+	// Graph operations patterns
+	if m := matchGraphOperation(msg); m != nil {
+		return h.executeGraphOperation(ctx, m)
+	}
+
+	return nil
+}
+
+// ============================================================
+// Pattern Matching for Direct Execution
+// ============================================================
+
+type FileOp struct {
+	Action string
+	Path   string
+	Pattern string
+	Content string
+	Dest   string
+}
+
+func matchFileOperation(msg string) *FileOp {
+	// read file patterns
+	readPatterns := []struct {
+		pattern *regexp.Regexp
+		action string
+	}{
+		{regexp.MustCompile(`^(?:read|show|cat|display|open)\s+(.+?)(?:\s+file)?$`), "read"},
+		{regexp.MustCompile(`^what(?:'s| is)\s+in\s+(.+)$`), "read"},
+	}
+	for _, p := range readPatterns {
+		if m := p.pattern.FindStringSubmatch(msg); m != nil {
+			return &FileOp{Action: p.action, Path: cleanPath(m[1])}
+		}
+	}
+
+	// list directory patterns
+	listPatterns := []struct {
+		pattern *regexp.Regexp
+		action string
+	}{
+		{regexp.MustCompile(`^(?:list|ls|dir)\s*(.*)$`), "list"},
+		{regexp.MustCompile(`^(?:show|what(?:'s| is))\s+(?:files?|in)\s+(.+)$`), "list"},
+	}
+	for _, p := range listPatterns {
+		if m := p.pattern.FindStringSubmatch(msg); m != nil {
+			path := "."
+			if m[1] != "" {
+				path = cleanPath(m[1])
+			}
+			return &FileOp{Action: p.action, Path: path}
+		}
+	}
+
+	// search patterns
+	searchPatterns := []struct {
+		pattern *regexp.Regexp
+		action string
+	}{
+		{regexp.MustCompile(`^(?:search|grep|find)\s+(.+?)\s+in\s+(.+)$`), "search"},
+		{regexp.MustCompile(`^(?:search|grep|find)\s+(.+?)\s+(?:for|in)\s+(.+)$`), "search"},
+	}
+	for _, p := range searchPatterns {
+		if m := p.pattern.FindStringSubmatch(msg); m != nil {
+			return &FileOp{Action: p.action, Pattern: m[1], Path: cleanPath(m[2])}
+		}
+	}
+
+	return nil
+}
+
+type SystemOp struct {
+	Action string
+	Target string
+	URL    string
+	Host   string
+}
+
+func matchSystemOperation(msg string) *SystemOp {
+	// open app
+	if m := regexp.MustCompile(`^(?:open|launch|start)\s+(.+?)(?:\s+app)?$`).FindStringSubmatch(msg); m != nil {
+		return &SystemOp{Action: "open_app", Target: m[1]}
+	}
+	// close app
+	if m := regexp.MustCompile(`^(?:close|quit|exit)\s+(.+?)(?:\s+app)?$`).FindStringSubmatch(msg); m != nil {
+		return &SystemOp{Action: "close_app", Target: m[1]}
+	}
+	// open url
+	if m := regexp.MustCompile(`^(?:open|goto|go to)\s+(https?://\S+)`).FindStringSubmatch(msg); m != nil {
+		return &SystemOp{Action: "open_url", URL: m[1]}
+	}
+	// ping
+	if m := regexp.MustCompile(`^(?:ping|check)\s+(\S+)`).FindStringSubmatch(msg); m != nil {
+		return &SystemOp{Action: "ping", Host: m[1]}
+	}
+	// status
+	if regexp.MustCompile(`^(?:status|how are you|what's your status)$`).MatchString(msg) {
+		return &SystemOp{Action: "status"}
+	}
+	return nil
+}
+
+type TaskOp struct {
+	Action string
+	Title  string
+	ID     string
+}
+
+func matchTaskOperation(msg string) *TaskOp {
+	// create task
+	if m := regexp.MustCompile(`^(?:create|add|new)\s+(?:task|todo|reminder)[:\s]+(.+)$`).FindStringSubmatch(msg); m != nil {
+		return &TaskOp{Action: "create", Title: m[1]}
+	}
+	// list tasks
+	if regexp.MustCompile(`^(?:list|show)\s*(?:my\s*)?(?:tasks?|todos)$`).MatchString(msg) {
+		return &TaskOp{Action: "list"}
+	}
+	// complete task
+	if m := regexp.MustCompile(`^(?:complete|done|finish)\s+(?:task|todo)\s+(\S+)$`).FindStringSubmatch(msg); m != nil {
+		return &TaskOp{Action: "complete", ID: m[1]}
+	}
+	return nil
+}
+
+type GraphOp struct {
+	Action string
+	Query  string
+	Name   string
+	Type   string
+}
+
+func matchGraphOperation(msg string) *GraphOp {
+	// graph stats
+	if regexp.MustCompile(`^(?:graph\s+)?stats?$`).MatchString(msg) {
+		return &GraphOp{Action: "stats"}
+	}
+	// search graph
+	if m := regexp.MustCompile(`^(?:graph\s+)?(?:search|find)\s+(.+)$`).FindStringSubmatch(msg); m != nil {
+		return &GraphOp{Action: "search", Query: m[1]}
+	}
+	// graph dump
+	if regexp.MustCompile(`^(?:graph\s+)?dump$`).MatchString(msg) {
+		return &GraphOp{Action: "dump"}
+	}
+	return nil
+}
+
+// ============================================================
+// Direct Execution Handlers
+// ============================================================
+
+func (h *HeadAgent) executeFileOperation(ctx context.Context, op *FileOp) *DirectExecution {
+	sub, ok := h.subagentReg.Get("file")
+	if !ok {
+		return &DirectExecution{Message: "File agent not available."}
+	}
+
+	input := buildFileInput(op)
 	step := &subagent.PlanStep{
 		ID:       1,
-		Subagent: intent.Category,
-		Action:   intent.Subcategory,
+		Subagent: "file",
+		Action:   op.Action,
 		Input:    input,
-		Timeout:  60,
+		Timeout:  30,
 	}
 
 	result, err := sub.Execute(ctx, step)
 	if err != nil {
-		return "", err
-	}
-	if result == nil {
-		return "Done.", nil
+		return &DirectExecution{Message: fmt.Sprintf("Error: %v", err)}
 	}
 	if !result.Success {
-		if result.Error != "" {
-			return fmt.Sprintf("Error: %s", result.Error), nil
-		}
-		return "I couldn't complete that.", nil
+		return &DirectExecution{Message: fmt.Sprintf("Error: %s", result.Error)}
 	}
-	return formatSubagentResult(result), nil
+
+	return &DirectExecution{
+		Message: formatToolResult(result),
+		Execution: &ToolExecution{
+			Tool:    "file",
+			Action:  op.Action,
+			Input:   input,
+			Output:  result.Data,
+			DurationMs: result.DurationMs,
+		},
+		Tool: "file",
+	}
 }
 
-func (h *HeadAgent) ingestMemory(ctx context.Context, message string) {
-	var facts []memory.MemoryFact
-	if h.memoryExtractor != nil {
-		llmFacts, err := h.memoryExtractor.Extract(ctx, message)
-		if err == nil && len(llmFacts) > 0 {
-			facts = llmFacts
+func (h *HeadAgent) executeSystemOperation(ctx context.Context, op *SystemOp) *DirectExecution {
+	sub, ok := h.subagentReg.Get("system")
+	if !ok {
+		return &DirectExecution{Message: "System agent not available."}
+	}
+
+	input := buildSystemInput(op)
+	step := &subagent.PlanStep{
+		ID:       1,
+		Subagent: "system",
+		Action:   op.Action,
+		Input:    input,
+		Timeout:  30,
+	}
+
+	result, err := sub.Execute(ctx, step)
+	if err != nil {
+		return &DirectExecution{Message: fmt.Sprintf("Error: %v", err)}
+	}
+	if !result.Success {
+		return &DirectExecution{Message: fmt.Sprintf("Error: %s", result.Error)}
+	}
+
+	return &DirectExecution{
+		Message: formatToolResult(result),
+		Execution: &ToolExecution{
+			Tool:   "system",
+			Action: op.Action,
+			Input:  input,
+			Output: result.Data,
+		},
+		Tool: "system",
+	}
+}
+
+func (h *HeadAgent) executeTaskOperation(ctx context.Context, op *TaskOp) *DirectExecution {
+	sub, ok := h.subagentReg.Get("task")
+	if !ok {
+		return &DirectExecution{Message: "Task agent not available."}
+	}
+
+	input := buildTaskInput(op)
+	step := &subagent.PlanStep{
+		ID:       1,
+		Subagent: "task",
+		Action:   op.Action,
+		Input:    input,
+		Timeout:  30,
+	}
+
+	result, err := sub.Execute(ctx, step)
+	if err != nil {
+		return &DirectExecution{Message: fmt.Sprintf("Error: %v", err)}
+	}
+	if !result.Success {
+		return &DirectExecution{Message: fmt.Sprintf("Error: %s", result.Error)}
+	}
+
+	return &DirectExecution{
+		Message: formatToolResult(result),
+		Execution: &ToolExecution{
+			Tool:   "task",
+			Action: op.Action,
+			Input:  input,
+			Output: result.Data,
+		},
+		Tool: "task",
+	}
+}
+
+func (h *HeadAgent) executeGraphOperation(ctx context.Context, op *GraphOp) *DirectExecution {
+	sub, ok := h.subagentReg.Get("graph")
+	if !ok {
+		return &DirectExecution{Message: "Graph agent not available."}
+	}
+
+	input := buildGraphInput(op, h.tenantID)
+	step := &subagent.PlanStep{
+		ID:       1,
+		Subagent: "graph",
+		Action:   op.Action,
+		Input:    input,
+		Timeout:  30,
+	}
+
+	result, err := sub.Execute(ctx, step)
+	if err != nil {
+		return &DirectExecution{Message: fmt.Sprintf("Error: %v", err)}
+	}
+	if !result.Success {
+		return &DirectExecution{Message: fmt.Sprintf("Error: %s", result.Error)}
+	}
+
+	return &DirectExecution{
+		Message: formatToolResult(result),
+		Execution: &ToolExecution{
+			Tool:   "graph",
+			Action: op.Action,
+			Input:  input,
+			Output: result.Data,
+		},
+		Tool: "graph",
+	}
+}
+
+// ============================================================
+// Prompt Building
+// ============================================================
+
+func (h *HeadAgent) buildSystemPrompt() string {
+	if h.promptBuilder == nil {
+		h.promptBuilder = prompt.NewBuilder(prompt.ModeFull)
+	}
+
+	// Build tool capabilities section
+	toolContext := h.buildToolContext()
+
+	// Build runtime context
+	runtimeContext := h.buildRuntimeContext()
+
+	// Safety guidelines
+	safety := `Confirm before:
+- Deleting files or directories
+- Running system commands
+- Opening/closing applications
+- Making any destructive changes
+
+Ask for clarification if the request is ambiguous.`
+
+	// Memory policy
+	memoryPolicy := `Store only durable facts about the user:
+- Name, role, contact info
+- Preferences (timezone, language, response style)
+- Recurring actions (when user says "X", do "Y")
+
+Ignore transient conversational content.`
+
+	// Core instruction - tool calling enabled
+	coreInstruction := `You are Flynn, a conversational AI assistant with tool capabilities.
+
+**Tool Calling**:
+When you need to use tools, use this bracket format:
+- [file.read path="main.go"]
+- [file.list path="."]
+- [file.write path="doc.md" content="..."]
+- [code.analyze path="."]
+- [code.run_tests path="."]
+- [task.create title="..."]
+
+Tool format: [tool.action param1="value1" param2="value2"]
+
+**Response Style**:
+- For simple questions, answer directly
+- For operations requiring tools, output tool calls in brackets
+- You can output multiple tool calls in sequence
+- After tool calls, briefly describe what you're doing
+- Keep responses concise and helpful`
+
+	return coreInstruction + "\n\n" + h.promptBuilder.BuildSystemPrompt(prompt.SystemContext{
+		Tooling:   toolContext,
+		Safety:    safety,
+		Memory:    memoryPolicy,
+		Runtime:   runtimeContext,
+		Workspace: h.buildWorkspaceContext(),
+		Bootstrap: h.promptBuilder.LoadBootstrapFiles([]string{"AGENTS.md"}),
+	})
+}
+
+func (h *HeadAgent) buildUserPrompt(message string, ctx context.Context) string {
+	var parts []string
+
+	// Add memory context if relevant
+	if memCtx := h.buildMemoryContext(ctx, message); memCtx != "" && memCtx != "None." {
+		parts = append(parts, fmt.Sprintf("## Memory Context\n%s", memCtx))
+	}
+
+	// Add graph context if available
+	if graphCtx := h.buildGraphContext(ctx, message); graphCtx != "" {
+		parts = append(parts, fmt.Sprintf("## Knowledge Graph\n%s", graphCtx))
+	}
+
+	// Add the user message
+	parts = append(parts, fmt.Sprintf("## User Message\n%s", message))
+
+	return strings.Join(parts, "\n\n")
+}
+
+func (h *HeadAgent) buildToolContext() string {
+	if h.subagentReg == nil {
+		return "No tools available."
+	}
+
+	subagents := h.subagentReg.All()
+	if len(subagents) == 0 {
+		return "No tools available."
+	}
+
+	names := make([]string, 0, len(subagents))
+	subByName := make(map[string]subagent.Subagent)
+	for _, s := range subagents {
+		names = append(names, s.Name())
+		subByName[s.Name()] = s
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	b.WriteString("## Available Tools\n\n")
+	b.WriteString("Call tools using bracket format: [tool.action param=\"value\"]\n\n")
+	for _, name := range names {
+		s := subByName[name]
+		caps := s.Capabilities()
+		sort.Strings(caps)
+		b.WriteString(fmt.Sprintf("**%s**: %s\n", name, s.Description()))
+		b.WriteString(fmt.Sprintf("Actions: %s\n", strings.Join(caps, ", ")))
+		// Add examples
+		switch name {
+		case "file":
+			b.WriteString("Examples: [file.list path=\".\"] [file.read path=\"main.go\"] [file.write path=\"test.txt\" content=\"hello\"]\n")
+		case "code":
+			b.WriteString("Examples: [code.analyze path=\".\"] [code.run_tests path=\".\"] [code.git_status path=\".\"]\n")
+		case "task":
+			b.WriteString("Examples: [task.create title=\"fix bug\"] [task.list] [task.complete id=\"1\"]\n")
+		case "graph":
+			b.WriteString("Examples: [graph.stats] [graph.search query=\"test\"] [graph.dump]\n")
+		case "system":
+			b.WriteString("Examples: [system.status] [system.open_app target=\"vscode\"]\n")
+		case "research":
+			b.WriteString("Examples: [research.search query=\"golang patterns\"]\n")
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func (h *HeadAgent) buildRuntimeContext() string {
+	if h.model != nil && h.model.IsAvailable() {
+		return fmt.Sprintf("Model: %s (cloud)", h.model.Name())
+	}
+	return "Model: not configured"
+}
+
+func (h *HeadAgent) buildWorkspaceContext() string {
+	// Could be enhanced to include git branch, recent files, etc.
+	return ""
+}
+
+func (h *HeadAgent) buildMemoryContext(ctx context.Context, message string) string {
+	if h.memoryStore == nil {
+		return "None."
+	}
+
+	// Try enhanced retrieval first (keyword-based relevance)
+	if h.memoryRetrieval != nil {
+		memories, err := h.memoryRetrieval.RetrieveRelevant(ctx, message, 8)
+		if err == nil && len(memories) > 0 {
+			// Check if any memory has meaningful relevance
+			for _, m := range memories {
+				if m.Score >= 0.3 { // Minimum threshold for relevance
+					ctx, _ := h.memoryRetrieval.RetrieveSemantic(ctx, message, 8)
+					if ctx != "" {
+						return ctx
+					}
+					break
+				}
+			}
 		}
 	}
-	if facts == nil && h.memoryRouter != nil {
-		facts = h.memoryRouter.ShouldIngest(message)
+
+	// Fall back to router-based retrieval for explicit requests
+	if h.memoryRouter != nil && h.memoryRouter.ShouldRetrieve(message) {
+		profile, _ := h.memoryStore.ProfileSummary(ctx, 4)
+		actions, _ := h.memoryStore.ActionsSummary(ctx, 4)
+
+		var parts []string
+		if profile != "" {
+			parts = append(parts, "Profile:\n"+profile)
+		}
+		if actions != "" {
+			parts = append(parts, "Actions:\n"+actions)
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
 	}
+
+	return "None."
+}
+
+func (h *HeadAgent) buildGraphContext(ctx context.Context, message string) string {
+	if h.graphContext == nil {
+		return ""
+	}
+	contextText, err := h.graphContext.FromText(ctx, h.tenantID, message)
+	if err != nil {
+		return ""
+	}
+	if contextText == "" {
+		return ""
+	}
+	return contextText
+}
+
+// ============================================================
+// Memory Handling
+// ============================================================
+
+// extractMemoryFromResponse extracts memory facts from both user message and assistant response.
+func (h *HeadAgent) extractMemoryFromResponse(userMsg, assistantResp string) []memory.MemoryFact {
+	var facts []memory.MemoryFact
+
+	// Try LLM extraction first (more sophisticated)
+	if h.memoryExtractor != nil && h.model != nil && h.model.IsAvailable() {
+		// Extract from user message
+		userFacts, err := h.memoryExtractor.Extract(context.Background(), userMsg)
+		if err == nil && len(userFacts) > 0 {
+			facts = append(facts, userFacts...)
+		}
+
+		// Extract from assistant response (for learned behaviors)
+		respFacts, err := h.memoryExtractor.Extract(context.Background(),
+			"User said: "+userMsg+"\nAssistant learned: "+assistantResp)
+		if err == nil && len(respFacts) > 0 {
+			// Filter to only action patterns from responses
+			for _, f := range respFacts {
+				if f.Type == "action" {
+					facts = append(facts, f)
+				}
+			}
+		}
+	}
+
+	// Fall back to pattern-based extraction
+	if h.memoryRouter != nil && len(facts) == 0 {
+		routerFacts := h.memoryRouter.ShouldIngest(userMsg)
+		facts = append(facts, routerFacts...)
+	}
+
+	return facts
+}
+
+// ingestMemory processes and stores memory facts.
+func (h *HeadAgent) ingestMemory(ctx context.Context, userMsg, assistantResp string) {
+	facts := h.extractMemoryFromResponse(userMsg, assistantResp)
+
+	if len(facts) == 0 {
+		return
+	}
+
+	// Store each fact
+	stored := 0
 	for _, fact := range facts {
 		switch fact.Type {
 		case "profile":
 			if fact.Field != "" && fact.Value != "" {
+				// Check if we should skip (no overwrite and existing value)
 				if !fact.Overwrite {
 					if existing, _ := h.memoryStore.GetProfileField(ctx, fact.Field); existing != "" {
 						continue
 					}
 				}
-				_ = h.memoryStore.UpsertProfileField(ctx, fact.Field, fact.Value, fact.Confidence)
+				if err := h.memoryStore.UpsertProfileField(ctx, fact.Field, fact.Value, fact.Confidence); err == nil {
+					stored++
+				}
 			}
 		case "action":
 			if fact.Trigger != "" && fact.Action != "" {
+				// Check if we should skip
 				if !fact.Overwrite {
 					if existing, _ := h.memoryStore.GetAction(ctx, fact.Trigger); existing != "" {
 						continue
 					}
 				}
-				_ = h.memoryStore.UpsertAction(ctx, fact.Trigger, fact.Action, fact.Confidence)
+				if err := h.memoryStore.UpsertAction(ctx, fact.Trigger, fact.Action, fact.Confidence); err == nil {
+					stored++
+				}
 			}
 		}
+	}
+
+	if stored > 0 {
+		fmt.Fprintf(os.Stderr, "[MEMORY] Stored %d new facts\n", stored)
 	}
 }
 
@@ -282,452 +812,36 @@ func (h *HeadAgent) ingestMemoryFacts(ctx context.Context, facts []memory.Memory
 	}
 }
 
-func (h *HeadAgent) buildMemoryContext(ctx context.Context, message string) string {
-	if h.memoryStore == nil || h.memoryRouter == nil {
-		return "None."
-	}
-	if !h.memoryRouter.ShouldRetrieve(message) {
-		return "None."
-	}
+// ============================================================
+// Conversation Storage
+// ============================================================
 
-	profile, _ := h.memoryStore.ProfileSummary(ctx, 4)
-	actions, _ := h.memoryStore.ActionsSummary(ctx, 4)
-
-	var parts []string
-	if profile != "" {
-		parts = append(parts, "Profile:\n"+profile)
+func (h *HeadAgent) recordConversation(ctx context.Context, userMsg, assistantMsg string, mode ThreadMode) {
+	if err := h.storeConversation(ctx, userMsg, nil, mode); err != nil {
+		// Log but don't fail
 	}
-	if actions != "" {
-		parts = append(parts, "Actions:\n"+actions)
+	if h.graphIngestor != nil {
+		h.ingestConversation(ctx, userMsg, "user", mode)
+		h.ingestConversation(ctx, assistantMsg, "assistant", mode)
 	}
-	if len(parts) == 0 {
-		return "None."
-	}
-	return strings.Join(parts, "\n")
-}
-
-func hasRequiredInputs(category, action string, vars map[string]string) bool {
-	switch category {
-	case "code":
-		switch action {
-		case "explain", "refactor":
-			_, hasTarget := vars["target"]
-			_, hasPath := vars["path"]
-			return hasTarget || hasPath
-		case "run_tests":
-			return true
-		}
-	case "file":
-		switch action {
-		case "read", "write", "search", "delete", "info", "move", "copy":
-			_, hasPath := vars["path"]
-			return hasPath
-		}
-	case "research":
-		switch action {
-		case "web_search":
-			_, hasQuery := vars["query"]
-			return hasQuery
-		case "fetch_url":
-			_, hasURL := vars["url"]
-			return hasURL
-		}
-	case "graph":
-		switch action {
-		case "search":
-			_, hasQuery := vars["query"]
-			return hasQuery
-		case "relations", "related", "summarize":
-			_, hasName := vars["name"]
-			_, hasType := vars["type"]
-			return hasName && hasType
-		}
-	case "task":
-		switch action {
-		case "create":
-			_, hasTitle := vars["title"]
-			_, hasTask := vars["task"]
-			return hasTitle || hasTask
-		case "complete", "delete", "update":
-			_, hasID := vars["id"]
-			return hasID
-		}
-	}
-	return true
-}
-
-func varsToMessage(vars map[string]string) string {
-	if len(vars) == 0 {
-		return ""
-	}
-	var parts []string
-	for k, v := range vars {
-		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
-	}
-	return strings.Join(parts, ", ")
-}
-
-func formatSubagentResult(result *subagent.Result) string {
-	if result.Data == nil {
-		return "Done."
-	}
-	switch v := result.Data.(type) {
-	case string:
-		return v
-	default:
-		return fmt.Sprintf("%v", result.Data)
+	if h.memoryStore != nil {
+		h.ingestMemory(ctx, userMsg, assistantMsg)
 	}
 }
 
-// getOrCreatePlan looks up an existing plan or generates a new one.
-func (h *HeadAgent) getOrCreatePlan(ctx context.Context, intent *classifier.Intent, message string) (*planlib.Plan, error) {
-	// First, check if we have a plan for this intent
-	if h.planLib != nil {
-		// Try to get the best pattern
-		pattern, err := h.planLib.GetBestPattern(ctx, h.tenantID, intent.String())
-		if err == nil && pattern.SuccessRate > 0.7 {
-			// Use this successful plan
-			return h.planLib.GetByID(ctx, h.tenantID, pattern.PlanID)
-		}
-
-		// Try to get any plan for this intent
-		plan, err := h.planLib.GetByIntent(ctx, h.tenantID, intent.String())
-		if err == nil {
-			return plan, nil
-		}
+func (h *HeadAgent) ingestConversation(ctx context.Context, content string, role string, mode ThreadMode) {
+	if strings.TrimSpace(content) == "" {
+		return
 	}
-
-	// No plan found, generate one via AI
-	graphContext := h.buildGraphContext(ctx, message)
-	plan, err := h.generatePlan(ctx, intent, message, graphContext)
-	if err != nil {
-		return nil, err
+	source := graph.Source{
+		Type: "message",
+		Ref:  fmt.Sprintf("%s-%d", role, time.Now().UnixNano()),
 	}
-	if !planAllowed(intent, message, plan) {
-		return nil, fmt.Errorf("plan rejected by guardrails")
-	}
-	return plan, nil
+	title := fmt.Sprintf("%s message", role)
+	_, _ = h.graphIngestor.IngestText(ctx, h.tenantID, source, title, content)
 }
 
-// generatePlan generates a new plan using the AI model.
-func (h *HeadAgent) generatePlan(ctx context.Context, intent *classifier.Intent, message string, graphContext string) (*planlib.Plan, error) {
-	// Build prompt for plan generation
-	prompt := fmt.Sprintf(planGenerationPrompt, intent.String(), graphContext, message)
-
-	resp, err := h.model.Generate(ctx, &model.Request{
-		Prompt: prompt,
-		JSON:   true,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse the plan JSON
-	var plan planlib.Plan
-	if err := json.Unmarshal([]byte(resp.Text), &plan); err != nil {
-		return nil, fmt.Errorf("failed to parse plan: %w", err)
-	}
-
-	plan.Intent = intent.String()
-
-	// Validate the plan
-	if err := planlib.Validate(&plan); err != nil {
-		return nil, fmt.Errorf("invalid plan generated: %w", err)
-	}
-
-	// Store the plan
-	if h.planLib != nil {
-		if err := h.planLib.Store(ctx, h.tenantID, &plan); err != nil {
-			return nil, fmt.Errorf("failed to store plan: %w", err)
-		}
-	}
-
-	return &plan, nil
-}
-
-func (h *HeadAgent) directReply(ctx context.Context, message string) (string, error) {
-	reply, _, err := h.directReplyWithMemory(ctx, message)
-	return reply, err
-}
-
-func (h *HeadAgent) directReplyWithMemory(ctx context.Context, message string) (string, []memory.MemoryFact, error) {
-	if h.model == nil || !h.model.IsAvailable() {
-		return "I’m here. How can I help?", nil, nil
-	}
-	graphContext := h.buildGraphContext(ctx, message)
-	toolContext := h.buildToolContext()
-	memoryContext := h.buildMemoryContext(ctx, message)
-	prompt := fmt.Sprintf(`You are Flynn, a concise, helpful assistant.
-
-Tool Calls:
-%s
-
-Memory Context:
-%s
-
-Knowledge Graph Context:
-%s
-
-User Message:
-%s
-
-Return ONLY JSON:
-{
-  "reply": "string",
-  "memory": {
-    "profile": [{"field": "name|timezone|preference|dislike|role", "value": "string", "confidence": 0.0-1.0, "overwrite": false}],
-    "actions": [{"trigger": "phrase user says", "action": "what to do", "confidence": 0.0-1.0, "overwrite": false}]
-  }
-}
-
-Rules:
-- Only include durable facts in memory.
-- If no memory, return empty arrays.
-- Keep reply concise.`, toolContext, memoryContext, graphContext, message)
-
-	resp, err := h.model.Generate(ctx, &model.Request{Prompt: prompt, JSON: true})
-	if err != nil {
-		return "", nil, err
-	}
-
-	var parsed struct {
-		Reply  string `json:"reply"`
-		Memory struct {
-			Profile []struct {
-				Field      string  `json:"field"`
-				Value      string  `json:"value"`
-				Confidence float64 `json:"confidence"`
-				Overwrite  bool    `json:"overwrite"`
-			} `json:"profile"`
-			Actions []struct {
-				Trigger    string  `json:"trigger"`
-				Action     string  `json:"action"`
-				Confidence float64 `json:"confidence"`
-				Overwrite  bool    `json:"overwrite"`
-			} `json:"actions"`
-		} `json:"memory"`
-	}
-
-	if err := json.Unmarshal([]byte(resp.Text), &parsed); err != nil {
-		return "", nil, err
-	}
-
-	facts := make([]memory.MemoryFact, 0)
-	for _, p := range parsed.Memory.Profile {
-		if strings.TrimSpace(p.Field) == "" || strings.TrimSpace(p.Value) == "" {
-			continue
-		}
-		if p.Confidence < 0.8 {
-			continue
-		}
-		facts = append(facts, memory.MemoryFact{
-			Type:       "profile",
-			Field:      strings.TrimSpace(p.Field),
-			Value:      strings.TrimSpace(p.Value),
-			Confidence: p.Confidence,
-			Overwrite:  p.Overwrite,
-		})
-	}
-	for _, a := range parsed.Memory.Actions {
-		if strings.TrimSpace(a.Trigger) == "" || strings.TrimSpace(a.Action) == "" {
-			continue
-		}
-		if a.Confidence < 0.8 {
-			continue
-		}
-		facts = append(facts, memory.MemoryFact{
-			Type:       "action",
-			Trigger:    strings.TrimSpace(a.Trigger),
-			Action:     strings.TrimSpace(a.Action),
-			Confidence: a.Confidence,
-			Overwrite:  a.Overwrite,
-		})
-	}
-
-	return strings.TrimSpace(parsed.Reply), facts, nil
-}
-
-func (h *HeadAgent) buildToolContext() string {
-	if h.subagentReg == nil {
-		return "None."
-	}
-	subagents := h.subagentReg.All()
-	if len(subagents) == 0 {
-		return "None."
-	}
-
-	names := make([]string, 0, len(subagents))
-	subByName := make(map[string]subagent.Subagent)
-	for _, s := range subagents {
-		names = append(names, s.Name())
-		subByName[s.Name()] = s
-	}
-	sort.Strings(names)
-
-	var b strings.Builder
-	for _, name := range names {
-		caps := subByName[name].Capabilities()
-		sort.Strings(caps)
-		b.WriteString("- ")
-		b.WriteString(name)
-		b.WriteString(": ")
-		b.WriteString(strings.Join(caps, ", "))
-		b.WriteString("\n")
-	}
-	return strings.TrimSpace(b.String())
-}
-
-func localReply(message string) string {
-	msg := strings.TrimSpace(strings.ToLower(message))
-	switch {
-	case isGreeting(msg):
-		return "Hey! How can I help?"
-	case isAcknowledgement(msg):
-		return "Got it."
-	default:
-		return "I’m here. How can I help?"
-	}
-}
-
-func (h *HeadAgent) buildGraphContext(ctx context.Context, message string) string {
-	if h.graphContext == nil {
-		return ""
-	}
-	contextText, err := h.graphContext.FromText(ctx, h.tenantID, message)
-	if err != nil {
-		return ""
-	}
-	return contextText
-}
-
-// executePlan executes a plan through subagents.
-func (h *HeadAgent) executePlan(ctx context.Context, plan *planlib.Plan) (*planlib.PlanExecution, error) {
-	execution := &planlib.PlanExecution{
-		PlanID:    plan.ID,
-		Variables: make(map[string]any),
-		Results:   make([]planlib.StepResult, len(plan.Steps)),
-		Status:    "running",
-		StepCount: len(plan.Steps),
-	}
-
-	if h.planLib != nil {
-		if err := h.planLib.CreateExecution(ctx, h.tenantID, execution); err != nil {
-			// Continue anyway
-			fmt.Printf("Warning: failed to create execution record: %v\n", err)
-		}
-	}
-
-	// Track completed steps for dependencies
-	completed := make(map[int]bool)
-
-	// Execute steps in order
-	for _, step := range plan.Steps {
-		// Check dependencies
-		for _, dep := range step.Depends {
-			if !completed[dep] {
-				return execution, fmt.Errorf("dependency not met: step %d", dep)
-			}
-		}
-
-		// Create step context with timeout
-		var cancel context.CancelFunc
-		if step.Timeout > 0 {
-			ctx, cancel = context.WithTimeout(ctx, time.Duration(step.Timeout)*time.Second)
-		} else {
-			ctx, cancel = context.WithTimeout(ctx, 5*time.Minute)
-		}
-		defer cancel()
-
-		// Execute the step
-		result := h.executeStep(ctx, step)
-		execution.Results[step.ID-1] = *result
-		execution.StepsCompleted++
-		execution.TotalTokens += result.TokensUsed
-		execution.TotalCost += result.Cost
-
-		if !result.Success {
-			execution.Status = "failed"
-			execution.Error = result.Error
-			h.planLib.UpdateExecution(ctx, h.tenantID, execution)
-			return execution, fmt.Errorf("step %d failed: %s", step.ID, result.Error)
-		}
-
-		completed[step.ID] = true
-	}
-
-	execution.Status = "completed"
-
-	if h.planLib != nil {
-		h.planLib.UpdateExecution(ctx, h.tenantID, execution)
-	}
-
-	return execution, nil
-}
-
-// executeStep executes a single plan step.
-func (h *HeadAgent) executeStep(ctx context.Context, step planlib.PlanStep) *planlib.StepResult {
-	startTime := time.Now()
-
-	// Get the subagent
-	sub, ok := h.subagentReg.Get(step.Subagent)
-	if !ok {
-		return &planlib.StepResult{
-			StepID:  step.ID,
-			Success: false,
-			Error:   fmt.Sprintf("subagent %q not found", step.Subagent),
-		}
-	}
-
-	// Convert step input to subagent format
-	subStep := &subagent.PlanStep{
-		ID:       step.ID,
-		Subagent: step.Subagent,
-		Action:   step.Action,
-		Input:    step.Input,
-		Timeout:  step.Timeout,
-		Depends:  step.Depends,
-	}
-
-	// Execute
-	result, err := sub.Execute(ctx, subStep)
-
-	return &planlib.StepResult{
-		StepID:  step.ID,
-		Success: result != nil && err == nil,
-		Data:    result,
-		Error: func() string {
-			if err != nil {
-				return err.Error()
-			}
-			if result != nil && !result.Success {
-				return result.Error
-			}
-			return ""
-		}(),
-		TokensUsed: func() int {
-			if result != nil {
-				return result.TokensUsed
-			}
-			return 0
-		}(),
-		Cost: func() float64 {
-			if result != nil {
-				return result.Cost
-			}
-			return 0
-		}(),
-		DurationMs: time.Since(startTime).Milliseconds(),
-	}
-}
-
-// extractVariables extracts variables from the message based on intent.
-func (h *HeadAgent) extractVariables(message string, intent *classifier.Intent) map[string]string {
-	// Variables already extracted by classifier
-	return intent.Variables
-}
-
-// storeConversation stores the conversation in the appropriate database.
-func (h *HeadAgent) storeConversation(ctx context.Context, message string, execution *planlib.PlanExecution, mode ThreadMode) error {
+func (h *HeadAgent) storeConversation(ctx context.Context, message string, execution any, mode ThreadMode) error {
 	db := h.personalDB
 	msgTable := "messages"
 	convTable := "conversations"
@@ -738,8 +852,6 @@ func (h *HeadAgent) storeConversation(ctx context.Context, message string, execu
 		convTable = "team_conversations"
 	}
 
-	// For now, simple storage
-	// TODO: Implement proper conversation threading
 	conversationID := generateID()
 	messageID := generateID()
 	now := time.Now().Unix()
@@ -775,40 +887,15 @@ func (h *HeadAgent) storeConversation(ctx context.Context, message string, execu
 	return err
 }
 
-// formatResponse formats the execution results into a user-friendly message.
-func (h *HeadAgent) formatResponse(execution *planlib.PlanExecution) string {
-	if execution.Status == "failed" {
-		return fmt.Sprintf("I encountered an error: %s", execution.Error)
-	}
-
-	// Build response from step results
-	var parts []string
-	for i, result := range execution.Results {
-		if result.Success && result.Data != nil {
-			parts = append(parts, fmt.Sprintf("Step %d: %v", i+1, result.Data))
-		}
-	}
-
-	if len(parts) == 0 {
-		return "Done!"
-	}
-
-	return fmt.Sprintf("Plan completed successfully:\n%s", formatParts(parts))
-}
+// ============================================================
+// Status
+// ============================================================
 
 // GetStatus returns the current status of the Head Agent.
 func (h *HeadAgent) GetStatus(ctx context.Context) (*Status, error) {
 	status := &Status{
 		TenantID: h.tenantID,
 		UserID:   h.userID,
-	}
-
-	// Count plans
-	if h.planLib != nil {
-		patterns, err := h.planLib.ListPatterns(ctx, h.tenantID)
-		if err == nil {
-			status.PlansCount = len(patterns)
-		}
 	}
 
 	// List subagents
@@ -823,24 +910,60 @@ func (h *HeadAgent) GetStatus(ctx context.Context) (*Status, error) {
 	return status, nil
 }
 
+// ConsolidateMemory consolidates old memories to save space.
+func (h *HeadAgent) ConsolidateMemory(ctx context.Context, daysThreshold int) (int, error) {
+	if h.memoryRetrieval == nil {
+		return 0, fmt.Errorf("enhanced memory not available")
+	}
+	return h.memoryRetrieval.ConsolidateOldMemories(ctx, daysThreshold)
+}
+
+// ForgetMemory removes a specific memory by field or trigger.
+func (h *HeadAgent) ForgetMemory(ctx context.Context, memType, key string) error {
+	if h.memoryStore == nil {
+		return fmt.Errorf("memory store not available")
+	}
+
+	if memType == "profile" {
+		// Delete profile field
+		_, err := h.personalDB.ExecContext(ctx, `DELETE FROM memory_profile WHERE field = ?`, key)
+		return err
+	} else if memType == "action" {
+		// Delete action trigger
+		_, err := h.personalDB.ExecContext(ctx, `DELETE FROM memory_actions WHERE trigger = ?`, key)
+		return err
+	}
+
+	return fmt.Errorf("unknown memory type: %s", memType)
+}
+
 // ============================================================
 // Types
 // ============================================================
 
 // Response is the response from the Head Agent.
 type Response struct {
-	Intent     *classifier.Intent     `json:"intent"`
-	Message    string                 `json:"message"`
-	Execution  *planlib.PlanExecution `json:"execution"`
-	DurationMs int64                  `json:"duration_ms"`
-	Tier       int                    `json:"tier"`
+	Message    string          `json:"message"`
+	Execution  *ToolExecution  `json:"execution,omitempty"`
+	DurationMs int64           `json:"duration_ms"`
+	Tier       int             `json:"tier"`
+	TokensUsed int             `json:"tokens_used"`
+	ToolUsed   string          `json:"tool_used,omitempty"`
+}
+
+// ToolExecution represents a tool execution result.
+type ToolExecution struct {
+	Tool        string    `json:"tool"`
+	Action      string    `json:"action"`
+	Input       map[string]any `json:"input"`
+	Output      any       `json:"output"`
+	DurationMs  int64     `json:"duration_ms"`
 }
 
 // Status represents the Head Agent's status.
 type Status struct {
 	TenantID       string   `json:"tenant_id"`
 	UserID         string   `json:"user_id"`
-	PlansCount     int      `json:"plans_count"`
 	Subagents      []string `json:"subagents"`
 	ModelAvailable bool     `json:"model_available"`
 	ModelName      string   `json:"model_name"`
@@ -854,36 +977,97 @@ const (
 	ThreadModeTeam
 )
 
-type routeDecision int
+// ============================================================
+// Helpers
+// ============================================================
 
-const (
-	routePlan routeDecision = iota
-	routeDirect
-	routeLocal
-)
+func generateID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
 
-func routeRequest(message string, intent *classifier.Intent) routeDecision {
-	msg := strings.TrimSpace(strings.ToLower(message))
-	if msg == "" {
-		return routeLocal
+func cleanPath(p string) string {
+	p = strings.TrimSpace(p)
+	p = strings.Trim(p, `"`)
+	p = strings.Trim(p, "'")
+	return p
+}
+
+func buildFileInput(op *FileOp) map[string]any {
+	input := make(map[string]any)
+	if op.Path != "" {
+		input["path"] = op.Path
 	}
-
-	if isGreeting(msg) || isAcknowledgement(msg) {
-		return routeLocal
+	if op.Pattern != "" {
+		input["pattern"] = op.Pattern
 	}
+	if op.Content != "" {
+		input["content"] = op.Content
+	}
+	if op.Dest != "" {
+		input["dest"] = op.Dest
+	}
+	return input
+}
 
-	if intent != nil {
-		switch intent.Category {
-		case "code", "file", "task", "calendar", "graph", "system":
-			return routePlan
+func buildSystemInput(op *SystemOp) map[string]any {
+	input := make(map[string]any)
+	if op.Target != "" {
+		input["target"] = op.Target
+		input["name"] = op.Target
+	}
+	if op.URL != "" {
+		input["url"] = op.URL
+	}
+	if op.Host != "" {
+		input["host"] = op.Host
+	}
+	return input
+}
+
+func buildTaskInput(op *TaskOp) map[string]any {
+	input := make(map[string]any)
+	if op.Title != "" {
+		input["title"] = op.Title
+		input["task"] = op.Title
+	}
+	if op.ID != "" {
+		input["id"] = op.ID
+	}
+	return input
+}
+
+func buildGraphInput(op *GraphOp, tenantID string) map[string]any {
+	input := make(map[string]any)
+	input["tenant_id"] = tenantID
+	if op.Query != "" {
+		input["query"] = op.Query
+	}
+	if op.Name != "" {
+		input["name"] = op.Name
+	}
+	if op.Type != "" {
+		input["type"] = op.Type
+	}
+	return input
+}
+
+func formatToolResult(result *subagent.Result) string {
+	if result.Data == nil {
+		return "Done."
+	}
+	switch v := result.Data.(type) {
+	case string:
+		return v
+	case map[string]any:
+		// Format map as readable text
+		var parts []string
+		for k, val := range v {
+			parts = append(parts, fmt.Sprintf("%s: %v", k, val))
 		}
+		return strings.Join(parts, "\n")
+	default:
+		return fmt.Sprintf("%v", result.Data)
 	}
-
-	if hasToolVerbs(msg) {
-		return routePlan
-	}
-
-	return routeDirect
 }
 
 func isGreeting(msg string) bool {
@@ -904,88 +1088,171 @@ func isAcknowledgement(msg string) bool {
 	return false
 }
 
-func hasToolVerbs(msg string) bool {
-	verbs := []string{"run", "execute", "open", "read", "write", "edit", "search", "look up", "find", "fetch", "summarize", "browse", "install", "delete", "remove"}
-	for _, v := range verbs {
-		if strings.Contains(msg, v) {
-			return true
-		}
-	}
-	return false
+var greetings = []string{
+	"Hey! How can I help?",
+	"Hello! What's on your mind?",
+	"Hi there! Need a hand?",
 }
 
-func planAllowed(intent *classifier.Intent, message string, plan *planlib.Plan) bool {
-	if intent == nil || plan == nil {
-		return true
-	}
-	msg := strings.ToLower(message)
-	explicitSearch := strings.Contains(msg, "search") || strings.Contains(msg, "look up") || strings.Contains(msg, "google") || strings.Contains(msg, "browse")
+func randomGreeting() string {
+	return greetings[time.Now().UnixNano()%int64(len(greetings))]
+}
 
-	if strings.HasPrefix(intent.Category, "chat") && !explicitSearch {
-		for _, step := range plan.Steps {
-			if step.Subagent == "research" {
-				return false
+// ============================================================
+// Tool Calling
+// ============================================================
+
+// ToolCall represents a parsed tool call from LLM response.
+type ToolCall struct {
+	Tool   string
+	Action string
+	Params map[string]string
+}
+
+// parseToolCalls extracts tool calls from LLM response.
+// Supports formats like:
+// - <tool>file.read</tool><path>main.go</path>
+// - TOOL: file.read PATH: main.go
+func parseToolCalls(text string) []ToolCall {
+	var calls []ToolCall
+
+	// Format 1: XML-style tags: <tool>file.read</tool><path>main.go</path>
+	xmlRegex := regexp.MustCompile(`<tool>(\w+\.?\w*)</tool>(.*?)</tool>`)
+	xmlMatches := xmlRegex.FindAllStringSubmatch(text, -1)
+	for _, m := range xmlMatches {
+		if len(m) >= 3 {
+			tc := ToolCall{Tool: m[1], Params: make(map[string]string)}
+			// Parse params from content
+			paramRegex := regexp.MustCompile(`<(\w+)>([^<]+)</\1>`)
+			paramMatches := paramRegex.FindAllStringSubmatch(m[2], -1)
+			for _, pm := range paramMatches {
+				if len(pm) >= 3 {
+					tc.Params[pm[1]] = strings.TrimSpace(pm[2])
+				}
+			}
+			// Extract action from tool name (e.g., "file.read" -> action="read")
+			if parts := strings.Split(tc.Tool, "."); len(parts) == 2 {
+				tc.Tool = parts[0]
+				tc.Action = parts[1]
+			} else {
+				tc.Action = "execute"
+			}
+			calls = append(calls, tc)
+		}
+	}
+
+	// Format 2: Simple bracket format: [file.read path="main.go"]
+	bracketRegex := regexp.MustCompile(`\[(\w+\.?\w*)(?:\s+([^\]]+))?\]`)
+	bracketMatches := bracketRegex.FindAllStringSubmatch(text, -1)
+	for _, m := range bracketMatches {
+		if len(m) >= 2 {
+			tc := ToolCall{Tool: m[1], Params: make(map[string]string)}
+			if len(m) > 2 && m[2] != "" {
+				// Parse key="value" pairs
+				paramRegex := regexp.MustCompile(`(\w+)=["']([^"']+)["']`)
+				paramMatches := paramRegex.FindAllStringSubmatch(m[2], -1)
+				for _, pm := range paramMatches {
+					if len(pm) >= 3 {
+						tc.Params[pm[1]] = pm[2]
+					}
+				}
+			}
+			// Extract action from tool name
+			if parts := strings.Split(tc.Tool, "."); len(parts) == 2 {
+				tc.Tool = parts[0]
+				tc.Action = parts[1]
+			} else {
+				tc.Action = "execute"
+			}
+			calls = append(calls, tc)
+		}
+	}
+
+	return calls
+}
+
+// executeToolCall executes a single tool call.
+func (h *HeadAgent) executeToolCall(ctx context.Context, tc *ToolCall) (*subagent.Result, error) {
+	// Convert string params to any map
+	input := make(map[string]any)
+	for k, v := range tc.Params {
+		input[k] = v
+	}
+
+	// Get the subagent
+	sub, ok := h.subagentReg.Get(tc.Tool)
+	if !ok {
+		return nil, fmt.Errorf("unknown tool: %s", tc.Tool)
+	}
+
+	// Validate action
+	if !sub.ValidateAction(tc.Action) {
+		return nil, fmt.Errorf("unsupported action: %s", tc.Action)
+	}
+
+	// Execute
+	step := &subagent.PlanStep{
+		ID:       1,
+		Subagent: tc.Tool,
+		Action:   tc.Action,
+		Input:    input,
+		Timeout:  30,
+	}
+
+	return sub.Execute(ctx, step)
+}
+
+// executeToolCallsParallel executes multiple tool calls in parallel and aggregates results.
+func (h *HeadAgent) executeToolCallsParallel(ctx context.Context, toolCalls []ToolCall) string {
+	type toolResult struct {
+		index  int
+		call   *ToolCall
+		result *subagent.Result
+		err    error
+	}
+
+	resultChan := make(chan toolResult, len(toolCalls))
+
+	// Execute all tool calls in parallel
+	var wg sync.WaitGroup
+	for i, tc := range toolCalls {
+		wg.Add(1)
+		go func(idx int, call ToolCall) {
+			defer wg.Done()
+			result, err := h.executeToolCall(ctx, &call)
+			resultChan <- toolResult{index: idx, call: &call, result: result, err: err}
+		}(i, tc)
+	}
+
+	// Close channel when all goroutines complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results in order
+	results := make([]toolResult, len(toolCalls))
+	for r := range resultChan {
+		results[r.index] = r
+	}
+
+	// Format results for LLM
+	var output strings.Builder
+	output.WriteString(fmt.Sprintf("Executed %d tools in parallel:\n\n", len(toolCalls)))
+
+	for i, r := range results {
+		output.WriteString(fmt.Sprintf("### Tool %d: %s.%s\n", i+1, r.call.Tool, r.call.Action))
+		if r.err != nil {
+			output.WriteString(fmt.Sprintf("**Error**: %v\n\n", r.err))
+		} else if r.result != nil {
+			if !r.result.Success {
+				output.WriteString(fmt.Sprintf("**Error**: %s\n\n", r.result.Error))
+			} else {
+				output.WriteString(fmt.Sprintf("**Duration**: %dms\n", r.result.DurationMs))
+				output.WriteString(fmt.Sprintf("**Result**:\n%s\n\n", formatToolResult(r.result)))
 			}
 		}
 	}
 
-	return true
-}
-
-// ============================================================
-// Constants
-// ============================================================
-
-const planGenerationPrompt = `You are a plan generator for an AI assistant.
-
-Generate a JSON execution plan for the following request:
-
-Intent: %s
-Knowledge Graph Context:
-%s
-User Message: %s
-
-Return ONLY a JSON object with this format:
-{
-  "intent": "category.subcategory",
-  "description": "Brief description of what the plan does",
-  "steps": [
-    {
-      "id": 1,
-      "subagent": "subagent_name",
-      "action": "action_name",
-      "input": {"key": "value"},
-      "depends": [],
-      "timeout": 60
-    }
-  ],
-  "variables": [
-    {
-      "name": "var_name",
-      "type": "string|file_path|number",
-      "description": "What this variable is for",
-      "required": true,
-      "default": "default_value"
-    }
-  ]
-}
-
-Available subagents:
-- code: For coding tasks (analyze, run_tests, git_op, explain)
-- file: For file operations (read, write, search, list, delete)
-- research: For web research (web_search, fetch_url, summarize)
-- graph: For knowledge graph (ingest_file, ingest_text, entity_upsert, link, search, relations, related, summarize, stats)
-
-Respond with ONLY the JSON object.`
-
-func generateID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
-}
-
-func formatParts(parts []string) string {
-	var result string
-	for _, p := range parts {
-		result += "• " + p + "\n"
-	}
-	return result
+	return output.String()
 }

@@ -27,21 +27,31 @@ func (e *LLMExtractor) Extract(ctx context.Context, message string) ([]MemoryFac
 
 	threshold := e.Threshold
 	if threshold <= 0 {
-		threshold = 0.8
+		threshold = 0.7
 	}
 
-	prompt := fmt.Sprintf(`You extract durable user memory. Return ONLY JSON.
-Only include facts that are stable and useful later (name, preferences, personal workflows).
-Do NOT include transient questions or one-off requests.
-If the user corrects a prior fact, set "overwrite": true.
+	prompt := fmt.Sprintf(`You are a memory extraction system. Extract ONLY durable, useful user information.
 
-JSON format:
+Return JSON with these fields:
 {
-  "profile": [{"field": "name|timezone|preference|dislike|role", "value": "string", "confidence": 0.0-1.0, "overwrite": false}],
-  "actions": [{"trigger": "phrase user says", "action": "what to do", "confidence": 0.0-1.0, "overwrite": false}]
+  "profile": [
+    {"field": "name|timezone|language|location|role|company|preference|dislike", "value": "extracted value", "confidence": 0.0-1.0, "overwrite": false}
+  ],
+  "actions": [
+    {"trigger": "exact phrase user uses", "action": "what user wants to happen", "confidence": 0.0-1.0, "overwrite": false}
+  ]
 }
 
-Message:
+Rules:
+- ONLY extract facts that are likely to be useful in FUTURE conversations
+- Preferences: things the user likes/dislikes, their style, formatting preferences
+- Personal info: name, role, location, timezone, language
+- Actions: recurring patterns like "when I say X, do Y"
+- Set "overwrite": true if user is correcting a previous statement (uses "actually", "no, I mean", "wait")
+- Ignore: transient questions, one-off requests, temporary context
+- Minimum confidence: 0.7
+
+Message to analyze:
 %s`, message)
 
 	resp, err := e.Model.Generate(ctx, &model.Request{Prompt: prompt, JSON: true})

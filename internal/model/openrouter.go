@@ -60,11 +60,15 @@ func (c *OpenRouterClient) Generate(ctx context.Context, req *Request) (*Respons
 
 	// Build OpenRouter API request
 	body := map[string]any{
-		"model": c.cfg.Model,
-		"messages": []map[string]string{
-			{"role": "user", "content": req.Prompt},
-		},
+		"model":    c.cfg.Model,
+		"messages": []map[string]string{},
 	}
+	messages := []map[string]string{}
+	if strings.TrimSpace(req.System) != "" {
+		messages = append(messages, map[string]string{"role": "system", "content": req.System})
+	}
+	messages = append(messages, map[string]string{"role": "user", "content": req.Prompt})
+	body["messages"] = messages
 
 	// Set response format for JSON requests
 	if req.JSON {
