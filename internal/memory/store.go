@@ -9,8 +9,8 @@ import (
 	"database/sql"
 	"fmt"
 
-	// SQLite driver (required for database/sql registration).
-	_ "github.com/mattn/go-sqlite3"
+	// SQLite driver (pure Go, no CGO required).
+	_ "modernc.org/sqlite"
 )
 
 // Store manages both personal and team databases.
@@ -101,7 +101,7 @@ func openDBs(personalPath, teamPath string) (*Store, error) {
 
 // openDB opens a single SQLite database with optimal settings.
 func openDB(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=on&_journal_mode=WAL")
+	db, err := sql.Open("sqlite", dbPath+"?_foreign_keys=on&_journal_mode=WAL")
 	if err != nil {
 		return nil, err
 	}

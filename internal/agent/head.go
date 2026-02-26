@@ -26,6 +26,7 @@ import (
 	"github.com/flynn-ai/flynn/internal/memory"
 	"github.com/flynn-ai/flynn/internal/model"
 	"github.com/flynn-ai/flynn/internal/prompt"
+	"github.com/flynn-ai/flynn/internal/stats"
 	"github.com/flynn-ai/flynn/internal/subagent"
 )
 
@@ -44,6 +45,7 @@ type HeadAgent struct {
 	promptBuilder   *prompt.Builder
 	teamDB          *sql.DB
 	personalDB      *sql.DB
+	stats           *stats.Collector // Statistics tracking
 
 	// Streaming support
 	streamWriter io.Writer
@@ -81,6 +83,7 @@ func NewHeadAgent(cfg *Config) *HeadAgent {
 		promptBuilder:   cfg.PromptBuilder,
 		teamDB:          cfg.TeamDB,
 		personalDB:      cfg.PersonalDB,
+		stats:           stats.NewCollector(),
 	}
 
 	// Initialize enhanced memory retrieval
@@ -988,6 +991,36 @@ func (h *HeadAgent) GetStatus(ctx context.Context) (*Status, error) {
 	}
 
 	return status, nil
+}
+
+// GetStats returns detailed system statistics.
+func (h *HeadAgent) GetStats(ctx context.Context, dbPath string) (*stats.Stats, error) {
+	// Get database size (ignore errors - file may be locked)
+	dbSize := int64(0)
+	dbPathToUse := dbPath
+	if dbPath != "" {
+		if info, err := os.Stat(dbPath); err == nil {
+			dbSize = info.Size()
+		} else {
+			// File may be locked by SQLite WAL mode, just use empty path
+			dbPathToUse = ""
+		}
+	}
+
+	return h.stats.Collect(dbSize, dbPathToUse), nil
+}
+
+// RecordStats records request metrics.
+func (h *HeadAgent) RecordStats(tokens int, duration time.Duration, isError bool) {
+	h.stats.RecordRequest(tokens, duration)
+	if isError {
+		h.stats.RecordError()
+	}
+}
+
+// GetStatsCollector returns the stats collector for direct access.
+func (h *HeadAgent) GetStatsCollector() *stats.Collector {
+	return h.stats
 }
 
 // ConsolidateMemory consolidates old memories to save space.
