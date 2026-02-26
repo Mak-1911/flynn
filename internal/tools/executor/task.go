@@ -30,12 +30,12 @@ var (
 	}
 )
 
-// TaskCreate creates a new task.
+// TaskCreate creates a new task or updates an existing one (when id is provided).
 type TaskCreate struct{}
 
 func (t *TaskCreate) Name() string { return "task_create" }
 
-func (t *TaskCreate) Description() string { return "Create a new task" }
+func (t *TaskCreate) Description() string { return "Create or update a task" }
 
 func (t *TaskCreate) Execute(ctx context.Context, input map[string]any) (*Result, error) {
 	start := time.Now()
@@ -45,22 +45,43 @@ func (t *TaskCreate) Execute(ctx context.Context, input map[string]any) (*Result
 		return TimedResult(NewErrorResult(fmt.Errorf("title is required")), start), nil
 	}
 
+	// Check if this is an update (id provided) or create
+	id, hasID := input["id"].(string)
+	status, _ := input["status"].(string)
+	if status == "" {
+		status = "pending"
+	}
 	description, _ := input["description"].(string)
 
 	taskStore.Lock()
-	id := fmt.Sprintf("%d", taskStore.nextID)
+	defer taskStore.Unlock()
+
+	if hasID && id != "" {
+		// Update existing task
+		task, exists := taskStore.tasks[id]
+		if !exists {
+			return TimedResult(NewErrorResult(fmt.Errorf("task not found: %s", id)), start), nil
+		}
+		task.Title = title
+		task.Description = description
+		task.Status = status
+		task.UpdatedAt = time.Now()
+		return TimedResult(NewSuccessResult(task), start), nil
+	}
+
+	// Create new task
+	id = fmt.Sprintf("%d", taskStore.nextID)
 	taskStore.nextID++
 
 	task := &Task{
 		ID:          id,
 		Title:       title,
 		Description: description,
-		Status:      "pending",
+		Status:      status,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
 	}
 	taskStore.tasks[id] = task
-	taskStore.Unlock()
 
 	return TimedResult(NewSuccessResult(task), start), nil
 }

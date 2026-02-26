@@ -159,14 +159,14 @@ func (t *SystemOpenApp) Execute(ctx context.Context, input map[string]any) (*Res
 	}), start), nil
 }
 
-// SystemShell executes a shell command.
-type SystemShell struct{}
+// Bash executes bash/shell commands.
+type Bash struct{}
 
-func (t *SystemShell) Name() string { return "system_shell" }
+func (t *Bash) Name() string { return "bash" }
 
-func (t *SystemShell) Description() string { return "Execute shell command" }
+func (t *Bash) Description() string { return "Execute bash/shell commands" }
 
-func (t *SystemShell) Execute(ctx context.Context, input map[string]any) (*Result, error) {
+func (t *Bash) Execute(ctx context.Context, input map[string]any) (*Result, error) {
 	start := time.Now()
 
 	command, ok := input["command"].(string)

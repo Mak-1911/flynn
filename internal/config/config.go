@@ -47,6 +47,7 @@ func Default() *Config {
 				DefaultModel:  "arcee-ai/trinity-large-preview:free",
 				Mode:          string(CloudModeSmart),
 				MonthlyBudget: 10.0,
+				GLMModel:      "glm-4.7", // Default GLM model
 			},
 		},
 		Features: Features{

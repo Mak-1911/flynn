@@ -93,6 +93,29 @@ func (t *ResearchCite) Execute(ctx context.Context, input map[string]any) (*Resu
 	}), start), nil
 }
 
+// ResearchFetch fetches and reads a URL.
+type ResearchFetch struct{}
+
+func (t *ResearchFetch) Name() string { return "research_fetch_url" }
+
+func (t *ResearchFetch) Description() string { return "Fetch and read a URL" }
+
+func (t *ResearchFetch) Execute(ctx context.Context, input map[string]any) (*Result, error) {
+	start := time.Now()
+
+	url, ok := input["url"].(string)
+	if !ok || url == "" {
+		return TimedResult(NewErrorResult(fmt.Errorf("url is required")), start), nil
+	}
+
+	// Placeholder - actual URL fetching would be implemented
+	// using http client with proper timeout and error handling
+	return TimedResult(NewSuccessResult(map[string]any{
+		"url":     url,
+		"message": "URL fetch not yet implemented - integrate with HTTP client",
+	}), start), nil
+}
+
 // ResearchLearn learns from content.
 type ResearchLearn struct{}
 

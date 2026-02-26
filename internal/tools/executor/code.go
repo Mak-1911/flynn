@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -160,4 +161,55 @@ func (t *CodeGitLog) Name() string { return "code_git_log" }
 func (t *CodeGitLog) Description() string { return "Show git log" }
 func (t *CodeGitLog) Execute(ctx context.Context, input map[string]any) (*Result, error) {
 	return TimedResult(NewSuccessResult(map[string]any{"message": "Run 'git log' manually"}), time.Now()), nil
+}
+
+// CodeGitOp performs various git operations.
+type CodeGitOp struct{}
+
+func (t *CodeGitOp) Name() string { return "code_git_op" }
+
+func (t *CodeGitOp) Description() string { return "Perform git operations" }
+
+func (t *CodeGitOp) Execute(ctx context.Context, input map[string]any) (*Result, error) {
+	start := time.Now()
+
+	op, ok := input["op"].(string)
+	if !ok || op == "" {
+		return TimedResult(NewErrorResult(fmt.Errorf("op is required")), start), nil
+	}
+
+	path, _ := input["path"].(string)
+	if path == "" {
+		path = "."
+	}
+
+	// Build git command based on operation
+	args := []string{"-C", path, op}
+
+	// Add additional args if provided
+	if extraArgs, ok := input["args"].([]any); ok {
+		for _, arg := range extraArgs {
+			if s, ok := arg.(string); ok {
+				args = append(args, s)
+			}
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, "git", args...)
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		return TimedResult(NewSuccessResult(map[string]any{
+			"success": false,
+			"op":      op,
+			"output":  string(output),
+			"error":   err.Error(),
+		}), start), nil
+	}
+
+	return TimedResult(NewSuccessResult(map[string]any{
+		"success": true,
+		"op":      op,
+		"output":  string(output),
+	}), start), nil
 }

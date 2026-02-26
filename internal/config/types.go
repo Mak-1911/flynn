@@ -61,11 +61,13 @@ type LocalModelConfig struct {
 
 // CloudModelConfig configures cloud model usage.
 type CloudModelConfig struct {
-	Provider      string  `toml:"provider"`
+	Provider      string  `toml:"provider"` // openrouter, glm
 	DefaultModel  string  `toml:"default_model"`
 	Mode          string  `toml:"mode"` // never, smart, always
 	MonthlyBudget float64 `toml:"monthly_budget"`
-	APIKey        string  `toml:"api_key"` // API key for cloud provider
+	APIKey        string  `toml:"api_key"` // API key for cloud provider (OpenRouter, GLM, etc.)
+	GLMAPIKey     string  `toml:"glm_api_key"` // GLM (Z.AI) API key
+	GLMModel      string  `toml:"glm_model"` // GLM model: glm-4.7, glm-4.5-air
 	Enabled       bool    `toml:"enabled"` // Whether cloud is enabled
 }
 

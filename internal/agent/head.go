@@ -54,6 +54,11 @@ type HeadAgent struct {
 	// Streaming support
 	streamWriter io.Writer
 	streamMux    sync.Mutex
+
+	// Cached values to avoid repeated computation
+	cachedSystemPrompt string
+	cachedTools        []model.Tool
+	once               sync.Once
 }
 
 // Config configures the Head Agent.
@@ -112,6 +117,7 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 	startTime := time.Now()
 
 	// Step 1: Check for direct subagent execution patterns
+	directStart := time.Now()
 	if exec := h.tryDirectExecution(ctx, message); exec != nil {
 		resp := &Response{
 			Message:    exec.Message,
@@ -122,34 +128,79 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 		h.recordConversation(ctx, message, resp.Message, threadMode)
 		return resp, nil
 	}
+	directDuration := time.Since(directStart)
 
-	// Step 2: Build context for the LLM (with graceful degradation)
-	systemPrompt := h.buildSystemPrompt()
-	userPrompt := h.buildUserPrompt(message, ctx)
+	// Step 2: Build context for the LLM (with short timeout for DB operations)
+	// Create a separate context with short timeout just for context building
+	contextStart := time.Now()
+	contextCtx, contextCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 
-	// Prepare tools for the model
-	var modelTools []model.Tool
-	if h.tools != nil {
-		schemas := h.tools.ToOpenAIFormat()
-		for _, schema := range schemas {
-			if fn, ok := schema["function"].(map[string]interface{}); ok {
-				modelTools = append(modelTools, model.Tool{
-					Name:        fn["name"].(string),
-					Description: fn["description"].(string),
-					Parameters:  fn["parameters"].(map[string]interface{}),
-				})
+	// Cache expensive operations - system prompt and tool schemas
+	h.once.Do(func() {
+		cacheStart := time.Now()
+		h.cachedSystemPrompt = h.buildSystemPrompt()
+		if h.tools != nil {
+			schemas := h.tools.ToOpenAIFormat()
+			for _, schema := range schemas {
+				if fn, ok := schema["function"].(map[string]interface{}); ok {
+					h.cachedTools = append(h.cachedTools, model.Tool{
+						Name:        fn["name"].(string),
+						Description: fn["description"].(string),
+						Parameters:  fn["parameters"].(map[string]interface{}),
+					})
+				}
 			}
 		}
-	}
+		fmt.Fprintf(os.Stderr, "[TIMING] Cache built in %v\n", time.Since(cacheStart))
+		// Also log to file
+		if f, _ := os.OpenFile("C:\\Users\\ASUS\\.flynn\\timing.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); f != nil {
+			defer f.Close()
+			fmt.Fprintf(f, "[%s] Cache built in %v\n", time.Now().Format("15:04:05.000"), time.Since(cacheStart))
+		}
+	})
 
-	// Step 3: Call the model (explicitly non-streaming)
+	systemPrompt := h.cachedSystemPrompt
+	userPrompt := h.buildUserPromptWithTimeout(contextCtx, message)
+	contextCancel()
+
+	// Debug: Log prompts (only on first request or if file doesn't exist)
+	go func() {
+		logPath := "C:\\Users\\ASUS\\.flynn\\prompts.log"
+		if info, _ := os.Stat(logPath); info == nil || info.Size() == 0 {
+			if f, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); f != nil {
+				defer f.Close()
+				f.WriteString("=== SYSTEM PROMPT ===\n")
+				f.WriteString(systemPrompt)
+				f.WriteString("\n\n=== USER PROMPT EXAMPLE ===\n")
+				f.WriteString(userPrompt)
+				f.WriteString(fmt.Sprintf("\n\n=== SIZES ===\nSystem: %d chars | User: %d chars | Total: %d chars\n",
+					len(systemPrompt), len(userPrompt), len(systemPrompt)+len(userPrompt)))
+			}
+		}
+	}()
+
+	contextDuration := time.Since(contextStart)
+
+	// Step 3: Call the model with the original context (no timeout limit)
+	apiStart := time.Now()
 	resp, err := h.model.Generate(ctx, &model.Request{
 		System: systemPrompt,
 		Prompt: userPrompt,
-		Tools:  modelTools,
+		Tools:  h.cachedTools,
 		JSON:   false,
 		Stream: false,
 	})
+	apiDuration := time.Since(apiStart)
+
+	// Log timing to file for debugging
+	go func() {
+		f, _ := os.OpenFile("C:\\Users\\ASUS\\.flynn\\timing.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if f != nil {
+			defer f.Close()
+			fmt.Fprintf(f, "[%s] Direct: %v | Context: %v | API: %v | Total: %v\n",
+				time.Now().Format("15:04:05.000"), directDuration, contextDuration, apiDuration, time.Since(startTime))
+		}
+	}()
 
 	if err != nil {
 		// Handle errors with graceful degradation
@@ -716,6 +767,48 @@ func (h *HeadAgent) buildUserPrompt(message string, ctx context.Context) string 
 	}
 
 	// Add the user message
+	parts = append(parts, fmt.Sprintf("## User Message\n%s", message))
+
+	return strings.Join(parts, "\n\n")
+}
+
+// buildUserPromptWithTimeout builds the user prompt with context timeouts to prevent hanging.
+// If context building takes too long, it skips that context and continues.
+func (h *HeadAgent) buildUserPromptWithTimeout(ctx context.Context, message string) string {
+	var parts []string
+	var memCtx, graphCtx string
+
+	// Get memory context with timeout
+	doneCh := make(chan string, 1)
+	go func() {
+		doneCh <- h.buildMemoryContext(ctx, message)
+	}()
+	select {
+	case memCtx = <-doneCh:
+	case <-ctx.Done():
+		memCtx = "" // Skip memory context if timeout
+	}
+
+	// Get graph context with timeout
+	doneCh2 := make(chan string, 1)
+	go func() {
+		doneCh2 <- h.buildGraphContext(ctx, message)
+	}()
+	select {
+	case graphCtx = <-doneCh2:
+	case <-ctx.Done():
+		graphCtx = "" // Skip graph context if timeout
+	}
+
+	// Add context if available
+	if memCtx != "" && memCtx != "None." {
+		parts = append(parts, fmt.Sprintf("## Memory Context\n%s", memCtx))
+	}
+	if graphCtx != "" {
+		parts = append(parts, fmt.Sprintf("## Knowledge Graph\n%s", graphCtx))
+	}
+
+	// Always add the user message
 	parts = append(parts, fmt.Sprintf("## User Message\n%s", message))
 
 	return strings.Join(parts, "\n\n")
@@ -1345,8 +1438,38 @@ func generateToolCallID() string {
 // Supports formats like:
 // - <tool>file.read</tool><path>main.go</path>
 // - TOOL: file.read PATH: main.go
+// - [tool_calls: [{"name": "file_list", "arguments": {"path": "."}}]]
 func parseToolCalls(text string) []ToolCall {
 	var calls []ToolCall
+
+	// Format 0: GLM JSON format: [tool_calls: [{"name": "tool_name", "arguments": {...}}]]
+	jsonRegex := regexp.MustCompile(`\[tool_calls:\s*\[(.*?)\]\]`)
+	jsonMatches := jsonRegex.FindStringSubmatch(text)
+	if len(jsonMatches) >= 2 {
+		// Parse the JSON array
+		jsonContent := "[" + jsonMatches[1] + "]"
+		var parsedCalls []struct {
+			Name      string                 `json:"name"`
+			Arguments map[string]interface{} `json:"arguments"`
+		}
+		if err := json.Unmarshal([]byte(jsonContent), &parsedCalls); err == nil {
+			for _, pc := range parsedCalls {
+				tc := ToolCall{Tool: pc.Name, Params: make(map[string]string)}
+				// Convert arguments to string params
+				for k, v := range pc.Arguments {
+					tc.Params[k] = fmt.Sprintf("%v", v)
+				}
+				// Extract action from tool name (e.g., "file_list" -> tool="file", action="list")
+				if parts := strings.Split(tc.Tool, "_"); len(parts) == 2 {
+					tc.Tool = parts[0]
+					tc.Action = parts[1]
+				} else {
+					tc.Action = "execute"
+				}
+				calls = append(calls, tc)
+			}
+		}
+	}
 
 	// Format 1: XML-style tags: <tool>file.read</tool><path>main.go</path>
 	xmlRegex := regexp.MustCompile(`<tool>(\w+\.?\w*)</tool>(.*?)</tool>`)

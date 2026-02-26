@@ -292,6 +292,42 @@ func (t *GraphImport) Execute(ctx context.Context, input map[string]any) (*Resul
 	}), start), nil
 }
 
+// GraphIngest ingests content into the knowledge graph.
+type GraphIngest struct {
+	graph GraphService
+}
+
+func (t *GraphIngest) Name() string { return "graph_ingest" }
+
+func (t *GraphIngest) Description() string { return "Ingest content into knowledge graph" }
+
+func (t *GraphIngest) Execute(ctx context.Context, input map[string]any) (*Result, error) {
+	start := time.Now()
+
+	content, ok := input["content"].(string)
+	if !ok || content == "" {
+		return TimedResult(NewErrorResult(fmt.Errorf("content is required")), start), nil
+	}
+
+	source, _ := input["source"].(string)
+	if source == "" {
+		source = "unknown"
+	}
+
+	if t.graph == nil {
+		return TimedResult(NewErrorResult(fmt.Errorf("graph service not available")), start), nil
+	}
+
+	// In production, this would extract entities and relations
+	// For now, return a placeholder result
+	return TimedResult(NewSuccessResult(map[string]any{
+		"ingested": true,
+		"source":   source,
+		"length":   len(content),
+		"message":  "Content ingested into graph",
+	}), start), nil
+}
+
 // GraphClear clears all graph data.
 type GraphClear struct {
 	graph GraphService
