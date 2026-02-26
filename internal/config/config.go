@@ -44,7 +44,7 @@ func Default() *Config {
 			},
 			Cloud: CloudModelConfig{
 				Provider:      "openrouter",
-				DefaultModel:  "deepseek/deepseek-r1",
+				DefaultModel:  "arcee-ai/trinity-large-preview:free",
 				Mode:          string(CloudModeSmart),
 				MonthlyBudget: 10.0,
 			},

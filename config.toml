@@ -45,7 +45,7 @@ models_dir = "~/.flynn/models"
 provider = "openrouter"
 
 # Default cloud model for Tier 3
-default_model = "deepseek/deepseek-r1"
+default_model = "arcee-ai/trinity-large-preview:free"
 
 # When to use cloud: never, smart, always
 mode = "smart"

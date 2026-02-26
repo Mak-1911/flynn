@@ -11,6 +11,7 @@ package agent
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,8 @@ import (
 	"github.com/flynn-ai/flynn/internal/prompt"
 	"github.com/flynn-ai/flynn/internal/stats"
 	"github.com/flynn-ai/flynn/internal/subagent"
+	"github.com/flynn-ai/flynn/internal/tools"
+	"github.com/flynn-ai/flynn/internal/tools/executor"
 )
 
 // HeadAgent is the main orchestrator for Flynn.
@@ -36,6 +39,7 @@ type HeadAgent struct {
 	userID          string
 	subagentReg     *subagent.Registry
 	model           model.Model
+	tools           *tools.Registry // Tool registry
 	graphIngestor   *graph.Ingestor
 	graphContext    *graph.ContextBuilder
 	memoryStore     *memory.MemoryStore
@@ -58,6 +62,7 @@ type Config struct {
 	UserID          string
 	Subagents       *subagent.Registry
 	Model           model.Model
+	Tools           *tools.Registry // Tool registry
 	GraphIngestor   *graph.Ingestor
 	GraphContext    *graph.ContextBuilder
 	MemoryStore     *memory.MemoryStore
@@ -75,6 +80,7 @@ func NewHeadAgent(cfg *Config) *HeadAgent {
 		userID:          cfg.UserID,
 		subagentReg:     cfg.Subagents,
 		model:           cfg.Model,
+		tools:           cfg.Tools,
 		graphIngestor:   cfg.GraphIngestor,
 		graphContext:    cfg.GraphContext,
 		memoryStore:     cfg.MemoryStore,
@@ -121,10 +127,26 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 	systemPrompt := h.buildSystemPrompt()
 	userPrompt := h.buildUserPrompt(message, ctx)
 
+	// Prepare tools for the model
+	var modelTools []model.Tool
+	if h.tools != nil {
+		schemas := h.tools.ToOpenAIFormat()
+		for _, schema := range schemas {
+			if fn, ok := schema["function"].(map[string]interface{}); ok {
+				modelTools = append(modelTools, model.Tool{
+					Name:        fn["name"].(string),
+					Description: fn["description"].(string),
+					Parameters:  fn["parameters"].(map[string]interface{}),
+				})
+			}
+		}
+	}
+
 	// Step 3: Call the model (explicitly non-streaming)
 	resp, err := h.model.Generate(ctx, &model.Request{
 		System: systemPrompt,
 		Prompt: userPrompt,
+		Tools:  modelTools,
 		JSON:   false,
 		Stream: false,
 	})
@@ -134,8 +156,8 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 		return h.handleModelError(ctx, err, message, startTime, threadMode)
 	}
 
-	// Check for empty/incomplete response
-	if resp.Text == "" {
+	// Check for empty/incomplete response (only if no tool calls)
+	if resp.Text == "" && len(resp.ToolCalls) == 0 {
 		return nil, apperrors.NewBuilder(apperrors.CodeModelInvalidResponse, "model returned empty response").
 			Temporary().
 			WithSuggestion("Try rephrasing your request").
@@ -143,19 +165,43 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 			Build()
 	}
 
-	// Step 4: Check for tool calls in response and execute them
-	toolCalls := parseToolCalls(resp.Text)
+	// Step 4: Handle tool calls from the model
+	// First, check if model returned native tool calls
+	toolCalls := resp.ToolCalls
+
+	// Fallback: if no native tool calls, try parsing from text
+	// This handles models that don't support function calling natively
+	if len(toolCalls) == 0 && resp.Text != "" {
+		if parsedCalls := parseToolCalls(resp.Text); len(parsedCalls) > 0 {
+			// Convert parsed calls to model.ToolCall format
+			for _, pc := range parsedCalls {
+				input := map[string]any{"action": pc.Action}
+				for k, v := range pc.Params {
+					input[k] = v
+				}
+				toolCalls = append(toolCalls, model.ToolCall{
+					ID:    generateToolCallID(),
+					Name:  pc.Tool,
+					Input: input,
+				})
+			}
+		}
+	}
+
 	if len(toolCalls) > 0 {
-		// Execute tool calls in parallel and get tool info
-		toolResults, toolInfos := h.executeToolCallsParallelWithInfo(ctx, toolCalls)
+		// Execute tool calls
+		toolResults := h.executeToolCalls(ctx, toolCalls)
 
 		// Feed results back to LLM for final response
-		followUpPrompt := fmt.Sprintf("%s\n\nOriginal user request: %s\n\nTool execution results:\n%s\n\nPlease provide a helpful response based on these results.",
+		// IMPORTANT: Don't pass tools here - we want a text response, not more tool calls
+		followUpPrompt := fmt.Sprintf("%s\n\nOriginal user request: %s\n\nTool execution results:\n%s\n\nPlease provide a helpful response based on these results. Do NOT make any tool calls - just explain the results.",
 			userPrompt, message, toolResults)
 
 		finalResp, err := h.model.Generate(ctx, &model.Request{
 			System: systemPrompt,
 			Prompt: followUpPrompt,
+			// No tools - force text response
+			Tools:  nil,
 			JSON:   false,
 			Stream: false,
 		})
@@ -163,19 +209,13 @@ func (h *HeadAgent) Process(ctx context.Context, message string, threadMode Thre
 			// If final generation fails, return the tool results directly
 			return &Response{
 				Message: fmt.Sprintf("I executed the tools but couldn't generate a final response. Here are the raw results:\n\n%s", toolResults),
-				DurationMs:    time.Since(startTime).Milliseconds(),
-				Tier:          int(resp.Tier),
-				TokensUsed:    resp.TokensUsed,
-				ToolsExecuted: toolInfos,
+				DurationMs: time.Since(startTime).Milliseconds(),
 			}, nil
 		}
 
 		response := &Response{
-			Message:       finalResp.Text,
-			DurationMs:    time.Since(startTime).Milliseconds(),
-			Tier:          int(resp.Tier),
-			TokensUsed:    resp.TokensUsed + finalResp.TokensUsed,
-			ToolsExecuted: toolInfos,
+			Message:    finalResp.Text,
+			DurationMs: time.Since(startTime).Milliseconds(),
 		}
 		h.recordConversation(ctx, message, finalResp.Text, threadMode)
 		return response, nil
@@ -624,25 +664,33 @@ Ask for clarification if the request is ambiguous.`
 Ignore transient conversational content.`
 
 	// Core instruction - tool calling enabled
-	coreInstruction := `You are Flynn, a conversational AI assistant with tool capabilities.
+	coreInstruction := `You are Flynn, an AI assistant with access to tools.
 
-**Tool Calling**:
-When you need to use tools, use this bracket format:
-- [file.read path="main.go"]
-- [file.list path="."]
-- [file.write path="doc.md" content="..."]
-- [code.analyze path="."]
-- [code.run_tests path="."]
-- [task.create title="..."]
+**IMPORTANT - Tool Calling**:
+When a user request requires file operations, code analysis, web search, system commands, or any data retrieval:
+1. You MUST use the appropriate tool instead of making up answers
+2. Call the tool by name with proper parameters
+3. Wait for tool results before responding
+4. Summarize the actual tool results
 
-Tool format: [tool.action param1="value1" param2="value2"]
+**Tool Response Format**:
+- When you need to use a tool, respond ONLY with the tool call
+- Do NOT add conversational filler before tool calls
+- After receiving tool results, provide a clear summary
 
-**Response Style**:
-- For simple questions, answer directly
-- For operations requiring tools, output tool calls in brackets
-- You can output multiple tool calls in sequence
-- After tool calls, briefly describe what you're doing
-- Keep responses concise and helpful`
+**Examples**:
+User: "What files are in the current directory?"
+Assistant: [tool_calls: [{"name": "file_list", "arguments": {"path": "."}}]]
+
+User: "Search for 'function' in main.go"
+Assistant: [tool_calls: [{"name": "file_search", "arguments": {"path": "main.go", "pattern": "function"}}]]
+
+**Direct Response Only For**:
+- Greetings and simple pleasantries
+- Explaining concepts (no data retrieval needed)
+- Answering questions about your capabilities
+
+Everything else requires tool usage.`
 
 	return coreInstruction + "\n\n" + h.promptBuilder.BuildSystemPrompt(prompt.SystemContext{
 		Tooling:   toolContext,
@@ -674,49 +722,93 @@ func (h *HeadAgent) buildUserPrompt(message string, ctx context.Context) string 
 }
 
 func (h *HeadAgent) buildToolContext() string {
-	if h.subagentReg == nil {
-		return "No tools available."
-	}
-
-	subagents := h.subagentReg.All()
-	if len(subagents) == 0 {
-		return "No tools available."
-	}
-
-	names := make([]string, 0, len(subagents))
-	subByName := make(map[string]subagent.Subagent)
-	for _, s := range subagents {
-		names = append(names, s.Name())
-		subByName[s.Name()] = s
-	}
-	sort.Strings(names)
-
 	var b strings.Builder
 	b.WriteString("## Available Tools\n\n")
-	b.WriteString("Call tools using bracket format: [tool.action param=\"value\"]\n\n")
-	for _, name := range names {
-		s := subByName[name]
-		caps := s.Capabilities()
-		sort.Strings(caps)
-		b.WriteString(fmt.Sprintf("**%s**: %s\n", name, s.Description()))
-		b.WriteString(fmt.Sprintf("Actions: %s\n", strings.Join(caps, ", ")))
-		// Add examples
-		switch name {
-		case "file":
-			b.WriteString("Examples: [file.list path=\".\"] [file.read path=\"main.go\"] [file.write path=\"test.txt\" content=\"hello\"]\n")
-		case "code":
-			b.WriteString("Examples: [code.analyze path=\".\"] [code.run_tests path=\".\"] [code.git_status path=\".\"]\n")
-		case "task":
-			b.WriteString("Examples: [task.create title=\"fix bug\"] [task.list] [task.complete id=\"1\"]\n")
-		case "graph":
-			b.WriteString("Examples: [graph.stats] [graph.search query=\"test\"] [graph.dump]\n")
-		case "system":
-			b.WriteString("Examples: [system.status] [system.open_app target=\"vscode\"]\n")
-		case "research":
-			b.WriteString("Examples: [research.search query=\"golang patterns\"]\n")
+
+	// Add tools from the tool registry if available
+	if h.tools != nil {
+		schemas := h.tools.ToOpenAIFormat()
+		if len(schemas) > 0 {
+			b.WriteString("### File Operations\n")
+			b.WriteString("- file_read: Read file contents\n")
+			b.WriteString("- file_write: Write content to a file\n")
+			b.WriteString("- file_search: Search for content in files\n")
+			b.WriteString("- file_list: List directory contents\n")
+			b.WriteString("- file_delete: Delete a file or directory\n")
+			b.WriteString("- file_move: Move or rename a file\n")
+			b.WriteString("- file_copy: Copy a file\n")
+			b.WriteString("- file_mkdir: Create a directory\n")
+			b.WriteString("- file_exists: Check if a path exists\n")
+			b.WriteString("- file_info: Get file information\n\n")
+
+			b.WriteString("### Code Operations\n")
+			b.WriteString("- code_analyze: Analyze code structure and patterns\n")
+			b.WriteString("- code_search: Search code by patterns\n")
+			b.WriteString("- code_test_run: Run tests for a project\n")
+			b.WriteString("- code_lint: Lint code for issues\n")
+			b.WriteString("- code_format: Format code according to standards\n")
+			b.WriteString("- code_git_diff: Show git diff\n")
+			b.WriteString("- code_git_status: Show git status\n")
+			b.WriteString("- code_git_log: Show git commit history\n\n")
+
+			b.WriteString("### System Operations\n")
+			b.WriteString("- system_status: Show system status\n")
+			b.WriteString("- system_env: Show environment variables\n")
+			b.WriteString("- system_process_list: List running processes\n")
+			b.WriteString("- system_open_app: Open an application\n")
+			b.WriteString("- system_shell: Execute shell command\n")
+			b.WriteString("- system_kill: Terminate a process\n")
+			b.WriteString("- system_disk: Show disk usage\n")
+			b.WriteString("- system_memory: Show memory usage\n")
+			b.WriteString("- system_network: Show network info\n")
+			b.WriteString("- system_uptime: Show system uptime\n\n")
+
+			b.WriteString("### Task Operations\n")
+			b.WriteString("- task_create: Create a new task\n")
+			b.WriteString("- task_list: List all tasks\n")
+			b.WriteString("- task_update: Update a task\n")
+			b.WriteString("- task_complete: Mark a task as complete\n")
+			b.WriteString("- task_delete: Delete a task\n\n")
+
+			b.WriteString("### Graph Operations\n")
+			b.WriteString("- graph_stats: Show knowledge graph statistics\n")
+			b.WriteString("- graph_search: Search the knowledge graph\n")
+			b.WriteString("- graph_dump: Export graph data\n")
+			b.WriteString("- graph_query: Query graph relationships\n")
+			b.WriteString("- graph_add_entity: Add entity to graph\n")
+			b.WriteString("- graph_add_relation: Add relation to graph\n")
+			b.WriteString("- graph_export: Export graph to file\n")
+			b.WriteString("- graph_import: Import graph from file\n")
+			b.WriteString("- graph_clear: Clear all graph data\n\n")
+
+			b.WriteString("### Research Operations\n")
+			b.WriteString("- research_search: Search the web\n")
+			b.WriteString("- research_summarize: Summarize content\n")
+			b.WriteString("- research_cite: Cite sources\n")
+			b.WriteString("- research_learn: Learn from content\n")
 		}
-		b.WriteString("\n")
 	}
+
+	// Add subagent information
+	if h.subagentReg != nil {
+		subagents := h.subagentReg.All()
+		if len(subagents) > 0 {
+			b.WriteString("\n### Specialized Agents\n\n")
+			names := make([]string, 0, len(subagents))
+			subByName := make(map[string]subagent.Subagent)
+			for _, s := range subagents {
+				names = append(names, s.Name())
+				subByName[s.Name()] = s
+			}
+			sort.Strings(names)
+
+			for _, name := range names {
+				s := subByName[name]
+				b.WriteString(fmt.Sprintf("**%s**: %s\n", name, s.Description()))
+			}
+		}
+	}
+
 	return b.String()
 }
 
@@ -1202,10 +1294,17 @@ func isGreeting(msg string) bool {
 }
 
 func isAcknowledgement(msg string) bool {
-	for _, g := range []string{"thanks", "thank you", "thx", "ok", "okay", "got it", "cool"} {
-		if msg == g || strings.HasPrefix(msg, g+" ") {
+	// Only match exact standalone acknowledgements, not words that start sentences
+	// "ok" at the start of a sentence is NOT an acknowledgement
+	exactMatches := []string{"thanks", "thank you", "thx", "got it", "cool"}
+	for _, g := range exactMatches {
+		if msg == g {
 			return true
 		}
+	}
+	// "ok" and "okay" only match if they're exactly the message (not starting a sentence)
+	if msg == "ok" || msg == "okay" {
+		return true
 	}
 	return false
 }
@@ -1235,6 +1334,11 @@ type ToolCall struct {
 	Tool   string
 	Action string
 	Params map[string]string
+}
+
+// generateToolCallID generates a unique ID for a tool call.
+func generateToolCallID() string {
+	return fmt.Sprintf("call_%d", time.Now().UnixNano())
 }
 
 // parseToolCalls extracts tool calls from LLM response.
@@ -1411,4 +1515,88 @@ func (h *HeadAgent) executeToolCallsParallelWithInfo(ctx context.Context, toolCa
 	}
 
 	return output.String(), toolInfos
+}
+
+// executeToolCalls executes tool calls using the tool registry.
+func (h *HeadAgent) executeToolCalls(ctx context.Context, toolCalls []model.ToolCall) string {
+	type toolResult struct {
+		index   int
+		call    model.ToolCall
+		result  *executor.Result
+		err     error
+	}
+
+	resultChan := make(chan toolResult, len(toolCalls))
+	var wg sync.WaitGroup
+
+	// Execute all tool calls in parallel
+	for i, tc := range toolCalls {
+		wg.Add(1)
+		go func(idx int, call model.ToolCall) {
+			defer wg.Done()
+			
+			// Convert input to map[string]any
+			input := make(map[string]any)
+			for k, v := range call.Input {
+				input[k] = v
+			}
+			
+			var result *executor.Result
+			var err error
+			
+			if h.tools != nil {
+				result, err = h.tools.Execute(ctx, call.Name, input)
+			} else {
+				err = fmt.Errorf("tool registry not initialized")
+			}
+			
+			resultChan <- toolResult{index: idx, call: call, result: result, err: err}
+		}(i, tc)
+	}
+
+	// Close channel when all goroutines complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results in order
+	results := make([]toolResult, len(toolCalls))
+	for r := range resultChan {
+		results[r.index] = r
+	}
+
+	// Format results for LLM
+	var output strings.Builder
+	output.WriteString(fmt.Sprintf("Executed %d tools in parallel:\n\n", len(toolCalls)))
+
+	for _, r := range results {
+		output.WriteString(fmt.Sprintf("### Tool: %s\n", r.call.Name))
+		if r.err != nil {
+			output.WriteString(fmt.Sprintf("**Error**: %v\n\n", r.err))
+		} else if r.result != nil {
+			if !r.result.Success {
+				output.WriteString(fmt.Sprintf("**Error**: %s\n\n", r.result.Error))
+			} else {
+				output.WriteString(fmt.Sprintf("**Duration**: %dms\n", r.result.DurationMs))
+				output.WriteString(fmt.Sprintf("**Result**:\n%s\n\n", formatToolOutput(r.result.Data)))
+			}
+		}
+	}
+
+	return output.String()
+}
+
+// formatToolOutput formats tool output as a string.
+func formatToolOutput(data any) string {
+	if data == nil {
+		return ""
+	}
+	
+	// Try to format as JSON for structured data
+	if jsonBytes, err := json.MarshalIndent(data, "", "  "); err == nil {
+		return string(jsonBytes)
+	}
+	
+	return fmt.Sprintf("%v", data)
 }

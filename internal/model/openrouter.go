@@ -120,6 +120,24 @@ func (c *OpenRouterClient) generateWithRetry(ctx context.Context, req *Request) 
 	messages = append(messages, map[string]string{"role": "user", "content": req.Prompt})
 	body["messages"] = messages
 
+	// Add tools for function calling (OpenAI format)
+	if len(req.Tools) > 0 {
+		tools := []map[string]any{}
+		for _, tool := range req.Tools {
+			tools = append(tools, map[string]any{
+				"type":     "function",
+				"function": map[string]any{
+					"name":        tool.Name,
+					"description": tool.Description,
+					"parameters":  tool.Parameters,
+				},
+			})
+		}
+		body["tools"] = tools
+		// Set parallel tool calls (OpenRouter supports this)
+		body["parallel_tool_calls"] = true
+	}
+
 	// Set response format for JSON requests
 	if req.JSON {
 		body["response_format"] = map[string]string{"type": "json_object"}
@@ -219,11 +237,33 @@ func (c *OpenRouterClient) generateWithRetry(ctx context.Context, req *Request) 
 		return nil, errors.New(errors.CodeModelInvalidResponse, "API response contained no choices", errors.CategoryPermanent)
 	}
 
-	return &Response{
+	// Build model response
+	modelResp := &Response{
 		Text:       orResp.Choices[0].Message.Content,
 		TokensUsed: orResp.Usage.TotalTokens,
 		Model:      orResp.Model,
-	}, nil
+	}
+
+	// Parse tool calls if present
+	if len(orResp.Choices[0].Message.ToolCalls) > 0 {
+		for _, tc := range orResp.Choices[0].Message.ToolCalls {
+			if tc.Type == "function" {
+				// Parse arguments JSON string
+				var args map[string]any
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+					// If parsing fails, use as-is
+					args = map[string]any{"raw": tc.Function.Arguments}
+				}
+				modelResp.ToolCalls = append(modelResp.ToolCalls, ToolCall{
+					ID:    tc.ID,
+					Name:  tc.Function.Name,
+					Input: args,
+				})
+			}
+		}
+	}
+
+	return modelResp, nil
 }
 
 // handleRateLimitError creates a rate limit error with retry-after duration.
@@ -341,8 +381,9 @@ type openRouterResponse struct {
 	Choices []struct {
 		Index   int `json:"index"`
 		Message struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
+			Role         string `json:"role"`
+			Content      string `json:"content"`
+			ToolCalls    []openRouterToolCall `json:"tool_calls,omitempty"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -351,6 +392,15 @@ type openRouterResponse struct {
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
+}
+
+type openRouterToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 type openRouterStreamResponse struct {

@@ -20,16 +20,41 @@ type Request struct {
 	Stop        []string `json:"stop,omitempty"`
 	JSON        bool     `json:"json,omitempty"` // Request JSON output
 	Stream      bool     `json:"stream,omitempty"`
+	Tools       []Tool  `json:"tools,omitempty"` // Tools for function calling
 }
 
 // Response represents a model inference response.
 type Response struct {
-	Text       string  `json:"text"`
-	TokensUsed int     `json:"tokens_used"`
-	Cost       float64 `json:"cost"`
-	Model      string  `json:"model"`
-	DurationMs int64   `json:"duration_ms"`
-	Tier       Tier    `json:"tier"`
+	Text       string     `json:"text"`
+	TokensUsed int        `json:"tokens_used"`
+	Cost       float64    `json:"cost"`
+	Model      string     `json:"model"`
+	DurationMs int64      `json:"duration_ms"`
+	Tier       Tier       `json:"tier"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"` // Tool calls from model
+}
+
+// Tool represents a tool definition for function calling.
+type Tool struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Parameters  map[string]interface{} `json:"parameters"`
+}
+
+// ToolCall represents a tool call requested by the model.
+type ToolCall struct {
+	ID       string                 `json:"id"`
+	Name     string                 `json:"name"`
+	Input    map[string]interface{} `json:"input"`
+	Response *ToolCallResponse      `json:"response,omitempty"` // Populated after execution
+}
+
+// ToolCallResponse represents the result of a tool execution.
+type ToolCallResponse struct {
+	Success    bool   `json:"success"`
+	Data       any    `json:"data,omitempty"`
+	Error      string `json:"error,omitempty"`
+	DurationMs int64  `json:"duration_ms"`
 }
 
 // RouterConfig configures the model router.

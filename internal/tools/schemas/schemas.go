@@ -1,16 +1,13 @@
-// Package tool provides JSON schema definitions for OpenAI/Anthropic tool calling.
-// This is draft code for review - not yet integrated into the codebase.
-package tool
+// Package schemas provides JSON Schema definitions for OpenAI/Anthropic tool calling.
+package schemas
 
-import (
-	"encoding/json"
-)
+import "encoding/json"
 
 // Schema defines a tool's JSON schema for OpenAI/Anthropic formats.
 type Schema struct {
 	Name        string                 `json:"name"`
 	Description string                 `json:"description"`
-	Parameters  map[string]interface{} `json:"parameters"` // JSON Schema
+	Parameters  map[string]interface{} `json:"parameters"`
 }
 
 // SchemaBuilder provides a fluent interface for building tool schemas.
@@ -34,7 +31,6 @@ func NewSchema(name, description string) *SchemaBuilder {
 }
 
 // AddParam adds a parameter to the schema.
-// paramType should be a JSON Schema type: "string", "number", "boolean", "array", "object"
 func (b *SchemaBuilder) AddParam(name, paramType, description string, required bool) *SchemaBuilder {
 	props := b.schema.Parameters["properties"].(map[string]interface{})
 	props[name] = map[string]interface{}{
@@ -48,7 +44,7 @@ func (b *SchemaBuilder) AddParam(name, paramType, description string, required b
 	return b
 }
 
-// AddParamWithEnum adds a parameter with an enum constraint (specific values allowed).
+// AddParamWithEnum adds a parameter with an enum constraint.
 func (b *SchemaBuilder) AddParamWithEnum(name, paramType, description string, enum []string, required bool) *SchemaBuilder {
 	props := b.schema.Parameters["properties"].(map[string]interface{})
 	paramDef := map[string]interface{}{
@@ -62,18 +58,6 @@ func (b *SchemaBuilder) AddParamWithEnum(name, paramType, description string, en
 	if required {
 		req := b.schema.Parameters["required"].([]string)
 		b.schema.Parameters["required"] = append(req, name)
-	}
-	return b
-}
-
-// AddObjectParam adds an object parameter with nested properties.
-func (b *SchemaBuilder) AddObjectParam(name, description string, properties map[string]interface{}, required []string) *SchemaBuilder {
-	props := b.schema.Parameters["properties"].(map[string]interface{})
-	props[name] = map[string]interface{}{
-		"type":        "object",
-		"description": description,
-		"properties":  properties,
-		"required":    required,
 	}
 	return b
 }
@@ -114,7 +98,6 @@ func (r *Registry) List() []string {
 }
 
 // ToOpenAIFormat converts schemas to OpenAI function calling format.
-// Returns a slice of maps suitable for inclusion in the "tools" parameter.
 func (r *Registry) ToOpenAIFormat() []map[string]interface{} {
 	result := make([]map[string]interface{}, 0, len(r.schemas))
 	for _, schema := range r.schemas {
@@ -127,45 +110,24 @@ func (r *Registry) ToOpenAIFormat() []map[string]interface{} {
 }
 
 // ToAnthropicFormat converts schemas to Anthropic tool use format.
-// Returns a slice of maps suitable for inclusion in the "tools" parameter.
 func (r *Registry) ToAnthropicFormat() []map[string]interface{} {
 	result := make([]map[string]interface{}, 0, len(r.schemas))
 	for _, schema := range r.schemas {
-		anthropicSchema := map[string]interface{}{
+		result = append(result, map[string]interface{}{
 			"name":         schema.Name,
 			"description":  schema.Description,
 			"input_schema": schema.Parameters,
-		}
-		result = append(result, anthropicSchema)
+		})
 	}
 	return result
 }
 
-// ToJSON returns the registry as JSON for debugging/inspection.
+// ToJSON returns the registry as JSON for debugging.
 func (r *Registry) ToJSON() ([]byte, error) {
 	return json.MarshalIndent(r.schemas, "", "  ")
 }
 
-// Clone creates a deep copy of the registry.
-func (r *Registry) Clone() *Registry {
-	clone := NewRegistry()
-	for _, schema := range r.schemas {
-		// Deep copy parameters
-		paramsBytes, _ := json.Marshal(schema.Parameters)
-		var paramsCopy map[string]interface{}
-		json.Unmarshal(paramsBytes, &paramsCopy)
-
-		clone.Register(&Schema{
-			Name:        schema.Name,
-			Description: schema.Description,
-			Parameters:  paramsCopy,
-		})
-	}
-	return clone
-}
-
 // Merge merges another registry into this one.
-// Existing schemas with the same name are NOT overwritten.
 func (r *Registry) Merge(other *Registry) {
 	for name, schema := range other.schemas {
 		if _, exists := r.schemas[name]; !exists {
